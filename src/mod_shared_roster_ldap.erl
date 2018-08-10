@@ -39,7 +39,7 @@
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3]).
 
--export([get_user_roster/2,
+-export([get_user_roster/2,get_user_displayed_groups/1,
 	 get_jid_info/4, process_item/2, in_subscription/2,
 	 out_subscription/1, mod_opt_type/1, mod_options/1,
 	 opt_type/1, depends/2, transform_module_options/1]).

@@ -335,7 +335,7 @@ get_all_displayed_groups(Host) ->
     GroupAttr = State#state.group_attr,
     Entries = eldap_search(State,
 			    [eldap_filter:do_sub(State#state.rfilter,
-						[{<<"%g">>, <<"*">>}])],
+						[{<<"member=cn=%u.*[tw|com]">>, <<"cn=*">>}])],
 			   [GroupAttr]),
     Reply = lists:flatmap(fun (#eldap_entry{attributes =
 						Attrs}) ->
@@ -725,6 +725,7 @@ list_sr_groups_parse_delete(Host, Query) ->
 shared_roster_group(Host, Group, Query, Lang) ->
     Res = shared_roster_group_parse_query(Host, Group,
 					  Query),
+	GroupName = get_group_name(Host, Group),
  %%   GroupOpts = mod_shared_roster:get_group_opts(Host, Group),
  %%   Name = get_opt(GroupOpts, name, <<"">>),
  %%   Description = get_opt(GroupOpts, description, <<"">>),
@@ -747,7 +748,7 @@ shared_roster_group(Host, Group, Query, Lang) ->
 			[?XE(<<"tr">>,
 			     [?XCT(<<"td">>, <<"Name:">>),
 			      ?XE(<<"td">>,
-				  [?INPUT(<<"text">>, <<"name">>, <<"asda">>)])]),
+				  [?INPUT(<<"text">>, <<"name">>, GroupName)])]),
 			 ?XE(<<"tr">>,
 			     [?XCT(<<"td">>, <<"Description:">>),
 			      ?XE(<<"td">>,

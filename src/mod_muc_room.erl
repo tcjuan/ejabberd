@@ -1480,7 +1480,7 @@ get_default_role(Affiliation, StateData) ->
       outcast -> none;
       none ->
 	  case (StateData#state.config)#config.members_only of
-	    true -> none;
+	    true -> participant;
 	    _ ->
 		case (StateData#state.config)#config.members_by_default
 		    of
@@ -1874,7 +1874,24 @@ add_new_user(From, Nick, Packet, StateData) ->
 	gen_mod:get_module_opt(StateData#state.server_host,
 			       mod_muc, max_user_conferences),
     Collision = nick_collision(From, Nick, StateData),
-    IsSubscribeRequest = not is_record(Packet, presence),
+	Affiliations = get_affiliations(StateData),
+	Group_list = mod_shared_roster_ldap:get_user_displayed_groups({From#jid.user, StateData#state.server_host}),
+	TT = Affiliations,
+	 ?DEBUG("get_user_displayed_groups! ~w~n" , [Group_list]),
+	lists:foreach(fun(J)->
+						  AffNew =get_affiliation(jid:make(J, StateData#state.server_host), StateData) ,
+						  ?DEBUG("Affilation! ~s~n" , [AffNew]) ,
+					 case  AffNew of
+						member ->
+							?DEBUG("find in Affilation! ~s~n" , [J]);
+						_ -> 
+							?DEBUG("Miss in Affilation! ~s~n" , [J])	 
+					 end,
+					 ?DEBUG("each groups! ~s~n" , [J])
+				   end 
+				  ,Group_list),
+    ?DEBUG("Affilations! ~w~n" , [Group_list]),
+	IsSubscribeRequest = not is_record(Packet, presence),
     case {(ServiceAffiliation == owner orelse
 	     ((Affiliation == admin orelse Affiliation == owner)
 	       andalso NUsers < MaxAdminUsers)
