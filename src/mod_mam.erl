@@ -369,7 +369,9 @@ user_send_packet(Acc) ->
       -> {stanza(), c2s_state()}.
 user_send_packet_strip_tag({#message{} = Pkt, #{jid := JID} = C2SState}) ->
     LServer = JID#jid.lserver,
-    {strip_my_stanza_id(Pkt, LServer), C2SState};
+    Pkt1 = xmpp:del_meta(Pkt, stanza_id),
+    Pkt2 = strip_my_stanza_id(Pkt1, LServer),
+    {Pkt2, C2SState};
 user_send_packet_strip_tag(Acc) ->
     Acc.
 
@@ -416,6 +418,8 @@ get_stanza_id(#message{meta = #{stanza_id := ID}}) ->
 
 -spec init_stanza_id(stanza(), binary()) -> stanza().
 init_stanza_id(#message{meta = #{stanza_id := _ID}} = Pkt, _LServer) ->
+    Pkt;
+init_stanza_id(#message{meta = #{from_offline := true}} = Pkt, _LServer) ->
     Pkt;
 init_stanza_id(Pkt, LServer) ->
     ID = p1_time_compat:system_time(micro_seconds),

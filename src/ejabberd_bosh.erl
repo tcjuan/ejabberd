@@ -365,15 +365,22 @@ wait_for_session(#body{attrs = Attrs} = Req, From,
     {State3, RespEls} = get_response_els(State2),
     State4 = stop_inactivity_timer(State3),
     case RespEls of
-      [] ->
-	  State5 = restart_wait_timer(State4),
-	  Receivers = gb_trees:insert(RID, {From, Resp},
-				      State5#state.receivers),
-	  {next_state, active,
-	   State5#state{receivers = Receivers}};
-      _ ->
-	  reply_next_state(State4, Resp#body{els = RespEls}, RID,
-			   From)
+	[{xmlstreamstart, _, _} = El1] ->
+	    OutBuf = buf_in([El1], State4#state.el_obuf),
+	    State5 = restart_wait_timer(State4),
+	    Receivers = gb_trees:insert(RID, {From, Resp},
+					State5#state.receivers),
+	    {next_state, active,
+	     State5#state{receivers = Receivers, el_obuf = OutBuf}};
+	[] ->
+	    State5 = restart_wait_timer(State4),
+	    Receivers = gb_trees:insert(RID, {From, Resp},
+					State5#state.receivers),
+	    {next_state, active,
+	     State5#state{receivers = Receivers}};
+	_ ->
+	    reply_next_state(State4, Resp#body{els = RespEls}, RID,
+			     From)
     end;
 wait_for_session(_Event, _From, State) ->
     ?ERROR_MSG("unexpected sync event in 'wait_for_session': ~p",
@@ -572,7 +579,8 @@ handle_sync_event(_Event, _From, StateName, State) ->
 
 handle_info({timeout, TRef, wait_timeout}, StateName,
 	    #state{wait_timer = TRef} = State) ->
-    {next_state, StateName, drop_holding_receiver(State)};
+    State2 = State#state{wait_timer = undefined},
+    {next_state, StateName, drop_holding_receiver(State2)};
 handle_info({timeout, TRef, inactive}, _StateName,
 	    #state{inactivity_timer = TRef} = State) ->
     {stop, normal, State};
@@ -691,7 +699,8 @@ drop_holding_receiver(State, RID) ->
 					    State1#state.receivers),
 	    State2 = State1#state{receivers = Receivers},
 	    do_reply(State2, From, Body, RID);
-	none -> State
+	none ->
+	    restart_inactivity_timer(State)
     end.
 
 do_reply(State, From, Body, RID) ->
