@@ -55,6 +55,7 @@ init_config(Config) ->
     CfgContent = process_config_tpl(CfgContentTpl, [
                                                     {c2s_port, 5222},
                                                     {loglevel, 4},
+                                                    {new_schema, false},
                                                     {s2s_port, 5269},
 						    {component_port, 5270},
                                                     {web_port, 5280},
@@ -471,7 +472,9 @@ wait_auth_SASL_result(Config, ShouldFail) ->
 	    NS = if Type == client -> ?NS_CLIENT;
 		    Type == server -> ?NS_SERVER
 		 end,
-	    receive #stream_start{xmlns = NS, version = {1,0}} -> ok end,
+	    Config2 = receive #stream_start{id = ID, xmlns = NS, version = {1,0}} ->
+		set_opt(stream_id, ID, Config)
+	    end,
             receive #stream_features{sub_els = Fs} ->
 		    if Type == client ->
 			    #xmpp_session{optional = true} =
@@ -488,7 +491,7 @@ wait_auth_SASL_result(Config, ShouldFail) ->
 			      set_opt(rosterver, true, ConfigAcc);
 			 (_, ConfigAcc) ->
 			      ConfigAcc
-		      end, Config, Fs)
+		      end, Config2, Fs)
 	    end;
         #sasl_challenge{text = ClientIn} ->
             {Response, SASL} = (?config(sasl, Config))(ClientIn),

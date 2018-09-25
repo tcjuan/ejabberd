@@ -230,7 +230,6 @@ process_iq(#iq{type = get, lang = Lang} = IQ) ->
     Txt = <<"Value 'get' of 'type' attribute is not allowed">>,
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_iq(#iq{lang = Lang} = IQ) ->
-    ?INFO_MSG("IQ = ~p", [IQ]),
     Txt = <<"No module is handling this query">>,
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
 
@@ -591,10 +590,7 @@ callback(_, _, _) ->
 now_priority() ->
     -p1_time_compat:system_time(micro_seconds).
 
--spec opt_type(captcha_cmd) -> fun((binary()) -> binary());
-	      (captcha_host) -> fun((binary()) -> binary());
-	      (captcha_limit) -> fun((pos_integer()) -> pos_integer());
-	      (atom()) -> [atom()].
+-spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
 opt_type(captcha_cmd) ->
     fun (FileName) ->
 	    F = iolist_to_binary(FileName), if F /= <<"">> -> F end

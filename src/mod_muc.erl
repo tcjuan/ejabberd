@@ -106,7 +106,7 @@
 -callback unregister_online_user(binary(), ljid(), binary(), binary()) -> any().
 -callback count_online_rooms_by_user(binary(), binary(), binary()) -> non_neg_integer().
 -callback get_online_rooms_by_user(binary(), binary(), binary()) -> [{binary(), binary()}].
--callback get_subscribed_rooms(binary(), binary(), jid()) -> [ljid()] | [].
+-callback get_subscribed_rooms(binary(), binary(), jid()) -> [{ljid(), [binary()]}] | [].
 
 %%====================================================================
 %% API
@@ -435,7 +435,7 @@ do_route1(Host, ServerHost, Access, HistorySize, RoomShaper,
     {_AccessRoute, AccessCreate, _AccessAdmin, _AccessPersistent} = Access,
     {Room, _, Nick} = jid:tolower(To),
     RMod = gen_mod:ram_db_mod(ServerHost, ?MODULE),
-    case find_online_available_room(RMod, ServerHost, Room, Host) of
+    case RMod:find_online_room(ServerHost, Room, Host) of
 	error ->
 	    case is_create_request(Packet) of
 		true ->
@@ -463,36 +463,10 @@ do_route1(Host, ServerHost, Access, HistorySize, RoomShaper,
 		    Err = xmpp:err_item_not_found(ErrText, Lang),
 		    ejabberd_router:route_error(Packet, Err)
 	    end;
-	locked_room ->
-	    Lang = xmpp:get_lang(Packet),
-	    ErrText = <<"Conference room was destroyed">>,
-	    Err = xmpp:err_item_not_found(ErrText, Lang),
-	    ejabberd_router:route_error(Packet, Err);
 	{ok, Pid} ->
 	    ?DEBUG("MUC: send to process ~p~n", [Pid]),
 	    mod_muc_room:route(Pid, Packet),
 	    ok
-    end.
-
-find_online_available_room(RMod, ServerHost, Room, Host) ->
-    case RMod:find_online_room(ServerHost, Room, Host) of
-	error ->
-	    error;
-	{ok, Pid} ->
-	    check_tombstone(Pid)
-    end.
-
--define(TOMBSTONE_REASON, <<"Expiring tombstone">>).
-
-check_tombstone(Pid) ->
-    case p1_fsm:sync_send_all_state_event(Pid, check_tombstone) of
-	not_tombstone ->
-	    {ok, Pid};
-	locked ->
-	    locked_room;
-	expired ->
-	    p1_fsm:send_all_state_event(Pid, {destroy, ?TOMBSTONE_REASON}),
-	    error
     end.
 
 -spec process_vcard(iq()) -> iq().
@@ -614,8 +588,8 @@ process_mucsub(#iq{type = get, from = From, to = To,
 		   sub_els = [#muc_subscriptions{}]} = IQ) ->
     Host = To#jid.lserver,
     ServerHost = ejabberd_router:host_of_route(Host),
-    RoomJIDs = get_subscribed_rooms(ServerHost, Host, From),
-    xmpp:make_iq_result(IQ, #muc_subscriptions{list = RoomJIDs});
+    Subs = get_subscribed_rooms(ServerHost, Host, From),
+    xmpp:make_iq_result(IQ, #muc_subscriptions{list = Subs});
 process_mucsub(#iq{lang = Lang} = IQ) ->
     Txt = <<"No module is handling this query">>,
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
@@ -745,14 +719,15 @@ get_subscribed_rooms(ServerHost, Host, From) ->
 	    lists:flatmap(
 	      fun({Name, _, Pid}) ->
 		      case p1_fsm:sync_send_all_state_event(Pid, {is_subscribed, BareFrom}) of
-			  true -> [jid:make(Name, Host)];
+			  {true, Nodes} ->
+				[#muc_subscription{jid = jid:make(Name, Host), events = Nodes}];
 			  false -> []
 		      end;
 		 (_) ->
 		      []
 	      end, Rooms);
 	V ->
-	    V
+	    [#muc_subscription{jid = Jid, events = Nodes} || {Jid, Nodes} <- V]
     end.
 
 get_nick(ServerHost, Host, From) ->
@@ -948,8 +923,6 @@ mod_opt_type(min_presence_interval) ->
     fun (I) when is_number(I), I >= 0 -> I end;
 mod_opt_type(room_shaper) ->
     fun (A) when is_atom(A) -> A end;
-mod_opt_type(tombstone_expiry) ->
-    fun (I) when is_integer(I) -> I end;
 mod_opt_type(user_message_shaper) ->
     fun (A) when is_atom(A) -> A end;
 mod_opt_type(user_presence_shaper) ->
@@ -1039,7 +1012,6 @@ mod_options(Host) ->
      {queue_type, ejabberd_config:default_queue_type(Host)},
      {regexp_room_id, <<"">>},
      {room_shaper, none},
-     {tombstone_expiry, 0},
      {user_message_shaper, none},
      {user_presence_shaper, none},
      {default_room_options,

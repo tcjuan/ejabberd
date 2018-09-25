@@ -533,9 +533,6 @@ handle_sync_event({change_config, Config}, _From,
 handle_sync_event({change_state, NewStateData}, _From,
 		  StateName, _StateData) ->
     {reply, {ok, NewStateData}, StateName, NewStateData};
-handle_sync_event(check_tombstone, _From,
-		  StateName, StateData) ->
-    {reply, check_tombstone(StateData), StateName, StateData};
 handle_sync_event({process_item_change, Item, UJID}, _From, StateName, StateData) ->
     case process_item_change(Item, StateData, UJID) of
 	{error, _} = Err ->
@@ -586,7 +583,12 @@ handle_sync_event({muc_unsubscribe, From}, _From, StateName, StateData) ->
 	    {reply, {error, get_error_text(Err)}, StateName, StateData}
     end;
 handle_sync_event({is_subscribed, From}, _From, StateName, StateData) ->
-    IsSubs = ?DICT:is_key(jid:split(From), StateData#state.subscribers),
+    IsSubs = case (?DICT):find(jid:split(From), StateData#state.subscribers) of
+	{ok, #subscriber{nodes = Nodes}} ->
+	    {true, Nodes};
+	error ->
+	    false
+    end,
     {reply, IsSubs, StateName, StateData};
 handle_sync_event(_Event, _From, StateName,
 		  StateData) ->
@@ -782,7 +784,8 @@ process_groupchat_message(#message{from = From, lang = Lang} = Packet, StateData
 			 drop ->
 			     {next_state, normal_state, StateData};
 			 NewPacket1 ->
-			     NewPacket = xmpp:remove_subtag(NewPacket1, #nick{}),
+			     NewPacket = xmpp:put_meta(xmpp:remove_subtag(NewPacket1, #nick{}),
+				 muc_sender_real_jid, From),
 			     Node = if Subject == [] -> ?NS_MUCSUB_NODES_MESSAGES;
 				       true -> ?NS_MUCSUB_NODES_SUBJECT
 				    end,
@@ -857,7 +860,7 @@ process_normal_message(From, #message{lang = Lang} = Pkt, StateData) ->
 	{ok, [#muc_invite{}|_] = Invitations} ->
 	    lists:foldl(
 	      fun(Invitation, AccState) ->
-		      process_invitation(From, Invitation, Lang, AccState)
+		      process_invitation(From, Pkt, Invitation, Lang, AccState)
 	      end, StateData, Invitations);
 	{ok, [{role, participant}]} ->
 	    process_voice_request(From, Pkt, StateData);
@@ -870,9 +873,9 @@ process_normal_message(From, #message{lang = Lang} = Pkt, StateData) ->
 	    StateData
     end.
 
--spec process_invitation(jid(), muc_invite(), binary(), state()) -> state().
-process_invitation(From, Invitation, Lang, StateData) ->
-    IJID = route_invitation(From, Invitation, Lang, StateData),
+-spec process_invitation(jid(), message(), muc_invite(), binary(), state()) -> state().
+process_invitation(From, Pkt, Invitation, Lang, StateData) ->
+    IJID = route_invitation(From, Pkt, Invitation, Lang, StateData),
     Config = StateData#state.config,
     case Config#config.members_only of
 	true ->
@@ -2229,7 +2232,9 @@ send_initial_presences_and_messages(From, Nick, Presence, NewState, OldState) ->
 send_self_presence(JID, State) ->
     AvatarHash = (State#state.config)#config.vcard_xupdate,
     DiscoInfo = make_disco_info(JID, State),
-    DiscoHash = mod_caps:compute_disco_hash(DiscoInfo, sha),
+    Extras = iq_disco_info_extras(<<"en">>, State, true),
+    DiscoInfo1 = DiscoInfo#disco_info{xdata = [Extras]},
+    DiscoHash = mod_caps:compute_disco_hash(DiscoInfo1, sha),
     Els1 = [#caps{hash = <<"sha-1">>,
 		  node = ejabberd_config:get_uri(),
 		  version = DiscoHash}],
@@ -2871,9 +2876,9 @@ process_item_change(Item, SD, UJID) ->
 			undefined ->
 				<<"">>
 		end,
+                St = erlang:get_stacktrace(),
 		?ERROR_MSG("failed to set item ~p~s: ~p",
-		       [Item, FromSuffix,
-			{E, {R, erlang:get_stacktrace()}}]),
+		       [Item, FromSuffix, {E, {R, St}}]),
 	    {error, xmpp:err_internal_server_error()}
     end.
 
@@ -3848,51 +3853,10 @@ destroy_room(DEl, StateData) ->
     case (StateData#state.config)#config.persistent of
       true ->
 	  mod_muc:forget_room(StateData#state.server_host,
-			      StateData#state.host, StateData#state.room),
-	  maybe_create_tombstone(DEl, StateData);
+			      StateData#state.host, StateData#state.room);
       false -> ok
     end,
     {result, undefined, stop}.
-
--define(TOMBSTONE_NAME, <<"Room tombstone">>).
--define(TOMBSTONE_REASON, <<"Expiring tombstone">>).
-
-maybe_create_tombstone(DEl, StateData) ->
-    case DEl#muc_destroy.reason of
-	?TOMBSTONE_REASON ->
-	    ok;
-	_ ->
-	    TombstoneExpiry = gen_mod:get_module_opt(StateData#state.server_host,
-					 mod_muc, tombstone_expiry),
-	    create_tombstone(TombstoneExpiry, StateData)
-    end.
-
-create_tombstone(TombstoneExpiry, _) when TombstoneExpiry =< 0 ->
-    ok;
-create_tombstone(TombstoneExpiry, #state{server_host = Server, host = Host, room = Room}) ->
-    ?INFO_MSG("Creating tombstone for room ~s@~s", [Room, Host]),
-    Password = integer_to_binary(misc:now_to_usec(now()) + TombstoneExpiry*1000000),
-    Opts1 = gen_mod:get_module_opt(Server, mod_muc, default_room_options),
-    {_, Opts2} = proplists:split(Opts1, [title, password, persistent, public]),
-    Opts3 = [{title, ?TOMBSTONE_NAME}, {password, Password}, {persistent, true}, {public, false} | Opts2],
-    mod_muc:create_room(
-	    Host,
-	    Room,
-	    jid:make(<<"tombstone">>, <<"">>),
-	    <<"">>,
-	    Opts3).
-
-check_tombstone(#state{config = Config}) ->
-    case Config#config.title of
-        ?TOMBSTONE_NAME ->
-            case binary_to_integer(Config#config.password) < misc:now_to_usec(now()) of
-                true ->
-                    expired;
-                false ->
-                    locked
-            end;
-        _ -> not_tombstone
-    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Disco
@@ -3952,10 +3916,11 @@ process_iq_disco_info(From, #iq{type = get, lang = Lang,
     try
 	true = mod_caps:is_valid_node(Node),
 	DiscoInfo = make_disco_info(From, StateData),
-	Hash = mod_caps:compute_disco_hash(DiscoInfo, sha),
-	Node = <<(ejabberd_config:get_uri())/binary, $#, Hash/binary>>,
 	Extras = iq_disco_info_extras(Lang, StateData, true),
-	{result, DiscoInfo#disco_info{node = Node, xdata = [Extras]}}
+	DiscoInfo1 = DiscoInfo#disco_info{xdata = [Extras]},
+	Hash = mod_caps:compute_disco_hash(DiscoInfo1, sha),
+	Node = <<(ejabberd_config:get_uri())/binary, $#, Hash/binary>>,
+	{result, DiscoInfo1#disco_info{node = Node}}
     catch _:{badmatch, _} ->
 	    Txt = <<"Invalid node name">>,
 	    {error, xmpp:err_item_not_found(Txt, Lang)}
@@ -4151,11 +4116,11 @@ process_iq_mucsub(From, #iq{type = get, lang = Lang,
     FAffiliation = get_affiliation(From, StateData),
     FRole = get_role(From, StateData),
     if FRole == moderator; FAffiliation == owner; FAffiliation == admin ->
-	    JIDs = dict:fold(
-		     fun(_, #subscriber{jid = J}, Acc) ->
-			     [J|Acc]
+	    Subs = dict:fold(
+		     fun(_, #subscriber{jid = J, nodes = Nodes}, Acc) ->
+			     [#muc_subscription{jid = J, events = Nodes}|Acc]
 		     end, [], StateData#state.subscribers),
-	    {result, #muc_subscriptions{list = JIDs}, StateData};
+	    {result, #muc_subscriptions{list = Subs}, StateData};
        true ->
 	    Txt = <<"Moderator privileges required">>,
 	    {error, xmpp:err_forbidden(Txt, Lang)}
@@ -4288,8 +4253,8 @@ check_invitation(From, Invitations, Lang, StateData) ->
 	    {error, xmpp:err_not_allowed(Txt, Lang)}
     end.
 
--spec route_invitation(jid(), muc_invite(), binary(), state()) -> jid().
-route_invitation(From, Invitation, Lang, StateData) ->
+-spec route_invitation(jid(), message(), muc_invite(), binary(), state()) -> jid().
+route_invitation(From, Pkt, Invitation, Lang, StateData) ->
     #muc_invite{to = JID, reason = Reason} = Invitation,
     Invite = Invitation#muc_invite{to = undefined, from = From},
     Password = case (StateData#state.config)#config.password_protected of
@@ -4328,10 +4293,12 @@ route_invitation(From, Invitation, Lang, StateData) ->
 		   type = normal,
 		   body = xmpp:mk_text(Body),
 		   sub_els = [XUser, XConference]},
-    ejabberd_hooks:run(muc_invite, StateData#state.server_host,
-		       [StateData#state.jid, StateData#state.config,
-			From, JID, Reason]),
-    ejabberd_router:route(Msg),
+    Msg2 = ejabberd_hooks:run_fold(muc_invite,
+				   StateData#state.server_host,
+				   Msg,
+				   [StateData#state.jid, StateData#state.config,
+				    From, JID, Reason, Pkt]),
+    ejabberd_router:route(Msg2),
     JID.
 
 %% Handle a message sent to the room by a non-participant.

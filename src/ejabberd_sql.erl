@@ -335,10 +335,10 @@ connecting(connect, #state{host = Host} = State) ->
             State2 = get_db_version(State1),
             {next_state, session_established, State2};
       {error, Reason} ->
-	  ?INFO_MSG("~p connection failed:~n** Reason: ~p~n** "
-		    "Retry after: ~p seconds",
-		    [State#state.db_type, Reason,
-		     State#state.start_interval div 1000]),
+	  ?WARNING_MSG("~p connection failed:~n** Reason: ~p~n** "
+		       "Retry after: ~p seconds",
+		       [State#state.db_type, Reason,
+			State#state.start_interval div 1000]),
 	  p1_fsm:send_event_after(State#state.start_interval,
 				      connect),
 	  {next_state, connecting, State}
@@ -621,7 +621,6 @@ sql_query_internal(Query) ->
 						   [Query], self(),
 						   [{timeout, QueryTimeout - 1000},
 						    {result_type, binary}])),
-		%% ?INFO_MSG("MySQL, Received result~n~p~n", [R]),
 		  R;
 	      sqlite ->
 		  Host = State#state.host,
@@ -1034,6 +1033,7 @@ init_mssql(Host) ->
     FreeTDS = io_lib:fwrite("[~s]~n"
 			    "\thost = ~s~n"
 			    "\tport = ~p~n"
+			    "\tclient charset = UTF-8~n"
 			    "\ttds version = 7.1~n",
 			    [Host, Server, Port]),
     ODBCINST = io_lib:fwrite("[freetds]~n"
@@ -1115,20 +1115,7 @@ check_error({error, Why} = Err, Query) ->
 check_error(Result, _Query) ->
     Result.
 
--spec opt_type(sql_database) -> fun((binary()) -> binary());
-	      (sql_keepalive_interval) -> fun((pos_integer()) -> pos_integer());
-	      (sql_password) -> fun((binary()) -> binary());
-	      (sql_port) -> fun((0..65535) -> 0..65535);
-	      (sql_server) -> fun((binary()) -> binary());
-	      (sql_username) -> fun((binary()) -> binary());
-	      (sql_ssl) -> fun((boolean()) -> boolean());
-	      (sql_ssl_verify) -> fun((boolean()) -> boolean());
-	      (sql_ssl_certfile) -> fun((boolean()) -> boolean());
-	      (sql_ssl_cafile) -> fun((boolean()) -> boolean());
-	      (sql_query_timeout) -> fun((pos_integer()) -> pos_integer());
-	      (sql_connect_timeout) -> fun((pos_integer()) -> pos_integer());
-	      (sql_queue_type) -> fun((ram | file) -> ram | file);
-	      (atom()) -> [atom()].
+-spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
 opt_type(sql_database) -> fun iolist_to_binary/1;
 opt_type(sql_keepalive_interval) ->
     fun (I) when is_integer(I), I > 0 -> I end;

@@ -166,7 +166,7 @@ process([<<"doc">>, LocalFile], _Request) ->
 		   "documentation with the environment variable "
 		   "EJABBERD_DOC_PATH. Check the ejabberd "
 		   "Guide for more information.">>,
-	  ?INFO_MSG("Problem '~p' accessing the local Guide file ~s", [Error, Help]),
+	  ?WARNING_MSG("Problem '~p' accessing the local Guide file ~s", [Error, Help]),
 	  case Error of
 	    eacces -> {403, [], <<"Forbidden", Help/binary>>};
 	    enoent -> {307, [{<<"Location">>, <<"http://docs.ejabberd.im/admin/guide/configuration/">>}], <<"Not found", Help/binary>>};
@@ -1873,7 +1873,7 @@ get_node(Host, Node, [<<"modules">>], Query, Lang)
 					      Modules, Query)
 	      of
 	    submitted -> ok;
-	    {'EXIT', Reason} -> ?INFO_MSG("~p~n", [Reason]), error;
+	    {'EXIT', Reason} -> ?ERROR_MSG("~p~n", [Reason]), error;
 	    _ -> nothing
 	  end,
     NewModules = lists:sort(ejabberd_cluster:call(Node, gen_mod,
@@ -2695,8 +2695,7 @@ make_menu_item(item, 3, URI, Name, Lang) ->
 %%%==================================
 
 
--spec opt_type(access_readonly) -> fun((any()) -> any());
-	      (atom()) -> [atom()].
+-spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
 opt_type(access_readonly) -> fun acl:access_rules_validator/1;
 opt_type(_) -> [access_readonly].
 
