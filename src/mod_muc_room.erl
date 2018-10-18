@@ -39,7 +39,8 @@
 	 is_occupant_or_admin/2,
 	 route/2,
 	 expand_opts/1,
-	 config_fields/0]).
+	 config_fields/0,
+	 unwrap_mucsub_message/1]).
 
 %% gen_fsm callbacks
 -export([init/1,
@@ -2923,8 +2924,13 @@ find_changed_items(UJID, UAffiliation, URole,
     TAffiliation = get_affiliation(JID, StateData),
     TRole = get_role(JID, StateData),
     ServiceAf = get_service_affiliation(JID, StateData),
+    UIsSubscriber = is_subscriber(UJID, StateData),
+    URole1 = case {URole, UIsSubscriber} of
+	{none, true} -> subscriber;
+	{UR, _} -> UR
+    end,
     CanChangeRA = case can_change_ra(UAffiliation,
-				     URole,
+				     URole1,
 				     TAffiliation,
 				     TRole, RoleOrAff, RoleOrAffValue,
 				     ServiceAf) of
@@ -3044,8 +3050,18 @@ can_change_ra(_FAffiliation, _FRole, _TAffiliation,
 can_change_ra(_FAffiliation, moderator, _TAffiliation,
 	      visitor, role, none, _ServiceAf) ->
     true;
+can_change_ra(FAffiliation, subscriber, _TAffiliation,
+	      visitor, role, none, _ServiceAf)
+    when (FAffiliation == owner) or
+	   (FAffiliation == admin) ->
+    true;
 can_change_ra(_FAffiliation, moderator, _TAffiliation,
 	      visitor, role, participant, _ServiceAf) ->
+    true;
+can_change_ra(FAffiliation, subscriber, _TAffiliation,
+	      visitor, role, participant, _ServiceAf)
+    when (FAffiliation == owner) or
+	   (FAffiliation == admin) ->
     true;
 can_change_ra(FAffiliation, _FRole, _TAffiliation,
 	      visitor, role, moderator, _ServiceAf)
@@ -3055,8 +3071,18 @@ can_change_ra(FAffiliation, _FRole, _TAffiliation,
 can_change_ra(_FAffiliation, moderator, _TAffiliation,
 	      participant, role, none, _ServiceAf) ->
     true;
+can_change_ra(FAffiliation, subscriber, _TAffiliation,
+	      participant, role, none, _ServiceAf)
+    when (FAffiliation == owner) or
+	   (FAffiliation == admin) ->
+    true;
 can_change_ra(_FAffiliation, moderator, _TAffiliation,
 	      participant, role, visitor, _ServiceAf) ->
+    true;
+can_change_ra(FAffiliation, subscriber, _TAffiliation,
+	      participant, role, visitor, _ServiceAf)
+    when (FAffiliation == owner) or
+	   (FAffiliation == admin) ->
     true;
 can_change_ra(FAffiliation, _FRole, _TAffiliation,
 	      participant, role, moderator, _ServiceAf)
@@ -3086,6 +3112,24 @@ can_change_ra(_FAffiliation, _FRole, admin, moderator,
     false;
 can_change_ra(admin, _FRole, _TAffiliation, moderator,
 	      role, participant, _ServiceAf) ->
+    true;
+can_change_ra(owner, moderator, TAffiliation,
+	      moderator, role, none, _ServiceAf)
+    when TAffiliation /= owner ->
+    true;
+can_change_ra(owner, subscriber, TAffiliation,
+	      moderator, role, none, _ServiceAf)
+    when TAffiliation /= owner ->
+    true;
+can_change_ra(admin, moderator, TAffiliation,
+	      moderator, role, none, _ServiceAf)
+    when (TAffiliation /= owner) and
+         (TAffiliation /= admin) ->
+    true;
+can_change_ra(admin, subscriber, TAffiliation,
+	      moderator, role, none, _ServiceAf)
+    when (TAffiliation /= owner) and
+         (TAffiliation /= admin) ->
     true;
 can_change_ra(_FAffiliation, _FRole, _TAffiliation,
 	      _TRole, role, _Value, _ServiceAf) ->
@@ -4234,7 +4278,8 @@ send_voice_request(From, Lang, StateData) ->
 			      ok | {error, stanza_error()}.
 check_invitation(From, Invitations, Lang, StateData) ->
     FAffiliation = get_affiliation(From, StateData),
-    CanInvite = (StateData#state.config)#config.allow_user_invites orelse
+    CanInvite = ((StateData#state.config)#config.allow_user_invites
+	        and not (StateData#state.config)#config.members_only) orelse
 	        FAffiliation == admin orelse FAffiliation == owner,
     case CanInvite of
 	true ->
@@ -4476,6 +4521,24 @@ wrap(From, To, Packet, Node) ->
 				items = [#ps_item{
 					    id = p1_rand:get_string(),
 					    sub_els = [El]}]}}]}.
+
+-spec unwrap_mucsub_message(xmpp_element()) -> message() | false.
+unwrap_mucsub_message(#message{} = Packet) ->
+    case xmpp:get_subtag(Packet, #ps_event{}) of
+	#ps_event{
+	    items = #ps_items{
+		node = Node,
+		items = [
+		    #ps_item{
+			sub_els = [#message{} = Message]} | _]}}
+	    when Node == ?NS_MUCSUB_NODES_MESSAGES;
+		 Node == ?NS_MUCSUB_NODES_SUBJECT ->
+	    Message;
+	_ ->
+	    false
+    end;
+unwrap_mucsub_message(_Packet) ->
+    false.
 
 %% -spec send_multiple(jid(), binary(), [#user{}], stanza()) -> ok.
 %% send_multiple(From, Server, Users, Packet) ->

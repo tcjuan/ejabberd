@@ -188,7 +188,7 @@ handle_auth_success(RServer, Mech, _AuthModule,
 		     State0#{auth_domains => AuthDomains1};
 		 false ->
 		     State
-	   end,
+	     end,
     ejabberd_hooks:run_fold(s2s_in_auth_result, ServerHost, State1, [true, RServer]).
 
 handle_auth_failure(RServer, Mech, Reason,
@@ -221,7 +221,7 @@ handle_authenticated_packet(Pkt0, #{ip := {IP, _}} = State) ->
 	    case Pkt1 of
 		drop -> ok;
 		_ -> ejabberd_router:route(Pkt1)
-    end,
+	    end,
 	    State2;
 	{error, Err} ->
 	    send(State, Err)
@@ -249,9 +249,9 @@ init([State, Opts]) ->
 		    (_) -> false
 		 end, Opts),
     TLSOpts2 = case proplists:get_bool(tls_compression, Opts) of
-                   false -> [compression_none | TLSOpts1];
-                   true -> TLSOpts1
-    end,
+		   false -> [compression_none | TLSOpts1];
+		   true -> TLSOpts1
+	       end,
     Timeout = ejabberd_config:negotiation_timeout(),
     State1 = State#{tls_options => TLSOpts2,
 		    auth_domains => sets:new(),
@@ -344,8 +344,8 @@ listen_opt_type(certfile = Opt) ->
     fun(S) ->
 	    ?WARNING_MSG("Listening option '~s' for ~s is deprecated, use "
 			 "'certfiles' global option instead", [Opt, ?MODULE]),
-	    ok = ejabberd_pkix:add_certfile(S),
-	    iolist_to_binary(S)
+	    {ok, File} = ejabberd_pkix:add_certfile(S),
+	    File
     end.
 
 listen_options() ->
