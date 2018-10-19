@@ -1925,6 +1925,7 @@ add_new_user(From, Nick, Packet, StateData) ->
 	gen_mod:get_module_opt(StateData#state.server_host,
 			       mod_muc, max_user_conferences),
     Collision = nick_collision(From, Nick, StateData),
+    IsSubscribeRequest = not is_record(Packet, presence),
 	Affiliations = get_affiliations(StateData),
 	Group_list = mod_shared_roster_ldap:get_user_displayed_groups({From#jid.user, StateData#state.server_host}),
 	TT = Affiliations,
@@ -1942,7 +1943,6 @@ add_new_user(From, Nick, Packet, StateData) ->
 				   end 
 				  ,Group_list),
     ?DEBUG("Affilations! ~w~n" , [Group_list]),
-	IsSubscribeRequest = not is_record(Packet, presence),
     case {(ServiceAffiliation == owner orelse
 	     ((Affiliation == admin orelse Affiliation == owner)
 	       andalso NUsers < MaxAdminUsers)
