@@ -1,5 +1,5 @@
 --
--- ejabberd, Copyright (C) 2002-2017   ProcessOne
+-- ejabberd, Copyright (C) 2002-2020   ProcessOne
 --
 -- This program is free software; you can redistribute it and/or
 -- modify it under the terms of the GNU General Public License as
@@ -156,13 +156,6 @@
 -- CREATE INDEX i_sm_sh_username ON sm USING btree (server_host, username);
 -- ALTER TABLE sm ALTER COLUMN server_host DROP DEFAULT;
 
--- ALTER TABLE carboncopy ADD COLUMN server_host text NOT NULL DEFAULT '<HOST>';
--- DROP INDEX i_carboncopy_ur;
--- DROP INDEX i_carboncopy_user;
--- ALTER TABLE carboncopy ADD PRIMARY KEY (server_host, username, resource);
--- CREATE INDEX i_carboncopy_sh_user ON carboncopy USING btree (server_host, username);
--- ALTER TABLE carboncopy ALTER COLUMN server_host DROP DEFAULT;
-
 
 CREATE TABLE users (
     username text NOT NULL,
@@ -289,7 +282,7 @@ CREATE TABLE vcard_search (
     server_host text NOT NULL,
     fn text NOT NULL,
     lfn text NOT NULL,
-    family text NOT NULL,
+    "family" text NOT NULL,
     lfamily text NOT NULL,
     given text NOT NULL,
     lgiven text NOT NULL,
@@ -536,6 +529,13 @@ CREATE TABLE oauth_token (
 
 CREATE UNIQUE INDEX i_oauth_token_token ON oauth_token USING btree (token);
 
+CREATE TABLE oauth_client (
+    client_id text PRIMARY KEY,
+    client_name text NOT NULL,
+    grant_type text NOT NULL,
+    options text NOT NULL
+);
+
 CREATE TABLE route (
     domain text NOT NULL,
     server_host text NOT NULL,
@@ -554,17 +554,6 @@ CREATE TABLE bosh (
 );
 
 CREATE UNIQUE INDEX i_bosh_sid ON bosh USING btree (sid);
-
-CREATE TABLE carboncopy (
-    username text NOT NULL,
-    server_host text NOT NULL,
-    resource text NOT NULL,
-    namespace text NOT NULL,
-    node text NOT NULL,
-    PRIMARY KEY (server_host, username, resource)
-);
-
-CREATE INDEX i_carboncopy_sh_user ON carboncopy USING btree (server_host, username);
 
 CREATE TABLE proxy65 (
     sid text NOT NULL,
@@ -589,3 +578,74 @@ CREATE TABLE push_session (
 );
 
 CREATE UNIQUE INDEX i_push_session_susn ON push_session USING btree (server_host, username, service, node);
+
+CREATE TABLE mix_channel (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    jid text NOT NULL,
+    hidden boolean NOT NULL,
+    hmac_key text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX i_mix_channel ON mix_channel (channel, service);
+CREATE INDEX i_mix_channel_serv ON mix_channel (service);
+
+CREATE TABLE mix_participant (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    jid text NOT NULL,
+    id text NOT NULL,
+    nick text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX i_mix_participant ON mix_participant (channel, service, username, domain);
+CREATE INDEX i_mix_participant_chan_serv ON mix_participant (channel, service);
+
+CREATE TABLE mix_subscription (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    node text NOT NULL,
+    jid text NOT NULL
+);
+
+CREATE UNIQUE INDEX i_mix_subscription ON mix_subscription (channel, service, username, domain, node);
+CREATE INDEX i_mix_subscription_chan_serv_ud ON mix_subscription (channel, service, username, domain);
+CREATE INDEX i_mix_subscription_chan_serv_node ON mix_subscription (channel, service, node);
+CREATE INDEX i_mix_subscription_chan_serv ON mix_subscription (channel, service);
+
+CREATE TABLE mix_pam (
+    username text NOT NULL,
+    server_host text NOT NULL,
+    channel text NOT NULL,
+    service text NOT NULL,
+    id text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX i_mix_pam ON mix_pam (username, server_host, channel, service);
+CREATE INDEX i_mix_pam_us ON mix_pam (username, server_host);
+
+CREATE TABLE mqtt_pub (
+    username text NOT NULL,
+    server_host text NOT NULL,
+    resource text NOT NULL,
+    topic text NOT NULL,
+    qos smallint NOT NULL,
+    payload bytea NOT NULL,
+    payload_format smallint NOT NULL,
+    content_type text NOT NULL,
+    response_topic text NOT NULL,
+    correlation_data bytea NOT NULL,
+    user_properties bytea NOT NULL,
+    expiry bigint NOT NULL
+);
+
+CREATE UNIQUE INDEX i_mqtt_topic_server ON mqtt_pub (topic, server_host);

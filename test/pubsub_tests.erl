@@ -3,7 +3,7 @@
 %%% Created : 16 Nov 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -55,6 +55,7 @@ single_cases() ->
       single_test(test_delete_item),
       single_test(test_purge),
       single_test(test_subscribe),
+      single_test(test_subscribe_max_item_1),
       single_test(test_unsubscribe)]}.
 
 test_features(Config) ->
@@ -86,7 +87,8 @@ test_features(Config) ->
 test_vcard(Config) ->
     JID = pubsub_jid(Config),
     ct:comment("Retreiving vCard from ~s", [jid:encode(JID)]),
-    #iq{type = result, sub_els = [#vcard_temp{}]} =
+    VCard = mod_pubsub_opt:vcard(?config(server, Config)),
+    #iq{type = result, sub_els = [VCard]} =
 	send_recv(Config, #iq{type = get, to = JID, sub_els = [#vcard_temp{}]}),
     disconnect(Config).
 
@@ -158,6 +160,16 @@ test_delete_item(Config) ->
 
 test_subscribe(Config) ->
     Node = create_node(Config, <<>>),
+    #ps_subscription{type = subscribed} = subscribe_node(Config, Node),
+    [#ps_subscription{node = Node}] = get_subscriptions(Config),
+    delete_node(Config, Node),
+    disconnect(Config).
+
+test_subscribe_max_item_1(Config) ->
+    DefaultNodeConfig = get_default_node_config(Config),
+    CustomNodeConfig = set_opts(DefaultNodeConfig,
+				[{max_items, 1}]),
+    Node = create_node(Config, <<>>, CustomNodeConfig),
     #ps_subscription{type = subscribed} = subscribe_node(Config, Node),
     [#ps_subscription{node = Node}] = get_subscriptions(Config),
     delete_node(Config, Node),

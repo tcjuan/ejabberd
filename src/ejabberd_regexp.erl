@@ -5,7 +5,7 @@
 %%% Created : 8 Dec 2011 by Badlop
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -125,13 +125,12 @@ sh_to_awk_3(<<"]", Sh/binary>>, false) ->
 sh_to_awk_3(<<C:8, Sh/binary>>, UpArrow) ->
     [C|sh_to_awk_3(Sh, UpArrow)];
 sh_to_awk_3(<<>>, true) ->
-    [$^|sh_to_awk_1([])];
+    [$^|sh_to_awk_1(<<>>)];
 sh_to_awk_3(<<>>, false) ->
-    sh_to_awk_1([]).
+    sh_to_awk_1(<<>>).
 
-%% -type sh_special_char(char()) -> bool().
 %%  Test if a character is a special character.
-
+-spec sh_special_char(char()) -> boolean().
 sh_special_char($|) -> true;
 sh_special_char($*) -> true;
 sh_special_char($+) -> true;
@@ -146,4 +145,3 @@ sh_special_char($[) -> true;
 sh_special_char($]) -> true;
 sh_special_char($") -> true;
 sh_special_char(_C) -> false.
-

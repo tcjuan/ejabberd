@@ -5,7 +5,7 @@
 %%% Created : 20 Jan 2016 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,9 +28,7 @@
 %% API
 -export([parse_transform/2, format_error/1]).
 
-%-export([parse/2]).
-
--include("ejabberd_sql_pt.hrl").
+-include("ejabberd_sql.hrl").
 
 -record(state, {loc,
                 'query' = [],
@@ -42,7 +40,8 @@
                 res_pos = 0,
                 server_host_used = false,
                 used_vars = [],
-                use_new_schema}).
+                use_new_schema,
+                need_array_pass = false}).
 
 -define(QUERY_RECORD, "sql_query").
 
@@ -65,10 +64,8 @@
 %% Description:
 %%--------------------------------------------------------------------
 parse_transform(AST, _Options) ->
-    %io:format("PT: ~p~nOpts: ~p~n", [AST, Options]),
     put(warnings, []),
     NewAST = top_transform(AST),
-    %io:format("NewPT: ~p~n", [NewAST]),
     NewAST ++ get(warnings).
 
 
@@ -140,7 +137,6 @@ transform(Form) ->
                     case erl_syntax:attribute_arguments(Form) of
                         [M | _] ->
                             Module = erl_syntax:atom_value(M),
-                            %io:format("module ~p~n", [Module]),
                             put(?MOD, Module),
                             Form;
                         _ ->
@@ -157,11 +153,7 @@ top_transform(Forms) when is_list(Forms) ->
     lists:map(
       fun(Form) ->
               try
-                  Form2 = erl_syntax_lib:map(
-                            fun(Node) ->
-                                                %io:format("asd ~p~n", [Node]),
-                                    transform(Node)
-                            end, Form),
+                  Form2 = erl_syntax_lib:map(fun transform/1, Form),
                   Form3 = erl_syntax:revert(Form2),
                   Form3
 	      catch
@@ -183,12 +175,24 @@ transform_sql(Arg) ->
               Pos, no_server_host),
             []
     end,
-    set_pos(
-      make_schema_check(
-        make_sql_query(ParseRes),
-        make_sql_query(ParseResOld)
-       ),
-      Pos).
+    case ParseRes#state.need_array_pass of
+        true ->
+            {PR1, PR2} = perform_array_pass(ParseRes),
+            {PRO1, PRO2} = perform_array_pass(ParseResOld),
+            set_pos(make_schema_check(
+                    erl_syntax:list([erl_syntax:tuple([erl_syntax:atom(pgsql), make_sql_query(PR2)]),
+                                     erl_syntax:tuple([erl_syntax:atom(any), make_sql_query(PR1)])]),
+                    erl_syntax:list([erl_syntax:tuple([erl_syntax:atom(pgsql), make_sql_query(PRO2)]),
+                                     erl_syntax:tuple([erl_syntax:atom(any), make_sql_query(PRO1)])])),
+                Pos);
+        false ->
+            set_pos(
+                make_schema_check(
+                    make_sql_query(ParseRes),
+                    make_sql_query(ParseResOld)
+                ),
+                Pos)
+    end.
 
 transform_upsert(Form, TableArg, FieldsArg) ->
     Table = erl_syntax:string_value(TableArg),
@@ -306,6 +310,35 @@ parse1([$%, $( | S], Acc, State) ->
                     false ->
                         append_string("0=0", State3)
                 end;
+            {list, InternalType} ->
+                Convert = erl_syntax:application(
+                    erl_syntax:atom(ejabberd_sql),
+                    erl_syntax:atom(to_list),
+                    [erl_syntax:record_access(
+                        erl_syntax:variable(?ESCAPE_VAR),
+                        erl_syntax:atom(?ESCAPE_RECORD),
+                        erl_syntax:atom(InternalType)),
+                     erl_syntax:variable(Name)]),
+                IT2 = case InternalType of
+                          string ->
+                              in_array_string;
+                          _ ->
+                              InternalType
+                      end,
+                ConvertArr = erl_syntax:application(
+                    erl_syntax:atom(ejabberd_sql),
+                    erl_syntax:atom(to_array),
+                    [erl_syntax:record_access(
+                        erl_syntax:variable(?ESCAPE_VAR),
+                        erl_syntax:atom(?ESCAPE_RECORD),
+                        erl_syntax:atom(IT2)),
+                     erl_syntax:variable(Name)]),
+                State2#state{'query' = [[{var, Var}] | State2#state.'query'],
+                             need_array_pass = true,
+                             args = [[Convert, ConvertArr] | State2#state.args],
+                             params = [Var | State2#state.params],
+                             param_pos = State2#state.param_pos + 1,
+                             used_vars = [Name | State2#state.used_vars]};
             _ ->
                 Convert =
                     erl_syntax:application(
@@ -321,6 +354,22 @@ parse1([$%, $( | S], Acc, State) ->
                              used_vars = [Name | State2#state.used_vars]}
         end,
     parse1(S1, [], State4);
+parse1("%ESCAPE" ++ S, Acc, State) ->
+    State1 = append_string(lists:reverse(Acc), State),
+    Convert =
+        erl_syntax:application(
+          erl_syntax:record_access(
+            erl_syntax:variable(?ESCAPE_VAR),
+            erl_syntax:atom(?ESCAPE_RECORD),
+            erl_syntax:atom(like_escape)),
+          []),
+    Var = State1#state.param_pos,
+    State2 =
+        State1#state{'query' = [{var, Var} | State1#state.'query'],
+                     args = [Convert | State1#state.args],
+                     params = [Var | State1#state.params],
+                     param_pos = State1#state.param_pos + 1},
+    parse1(S, [], State2);
 parse1([C | S], Acc, State) ->
     parse1(S, [C | Acc], State).
 
@@ -335,6 +384,19 @@ parse_name(S, IsArg, State) ->
 parse_name([], _Acc, _Depth, _IsArg, State) ->
     throw({error, State#state.loc,
            "expected ')', found end of string"});
+parse_name([$), $l, T | S], Acc, 0, true, State) ->
+    Type = case T of
+               $d -> {list, integer};
+               $s -> {list, string};
+               $b -> {list, boolean};
+               _ ->
+                   throw({error, State#state.loc,
+                          ["unknown type specifier 'l", T, "'"]})
+           end,
+    {lists:reverse(Acc), Type, S, State};
+parse_name([$), $l, T | _], _Acc, 0, false, State) ->
+    throw({error, State#state.loc,
+           ["list type 'l", T, "' is not allowed for outputs"]});
 parse_name([$), T | S], Acc, 0, IsArg, State) ->
     Type =
         case T of
@@ -362,6 +424,31 @@ make_var(V) ->
     Var = "__V" ++ integer_to_list(V),
     erl_syntax:variable(Var).
 
+perform_array_pass(State) ->
+    {NQ, PQ, Rest} = lists:foldl(
+        fun([{var, _} = Var], {N, P, {str, Str} = Prev}) ->
+            Str2 = re:replace(Str, "(^|\s+)in\s*$", " = any(", [{return, list}]),
+            {[Var, Prev | N], [{str, ")"}, Var, {str, Str2} | P], none};
+           ([{var, _}], _) ->
+               throw({error, State#state.loc, ["List variable not following 'in' operator"]});
+           (Other, {N, P, none}) ->
+               {N, P, Other};
+           (Other, {N, P, Prev}) ->
+               {[Prev | N], [Prev | P], Other}
+        end, {[], [], none}, State#state.query),
+    {NQ2, PQ2} = case Rest of
+                     none ->
+                         {NQ, PQ};
+                     _ -> {[Rest | NQ], [Rest | PQ]}
+                 end,
+    {NA, PA} = lists:foldl(
+        fun([V1, V2], {N, P}) ->
+            {[V1 | N], [V2 | P]};
+           (Other, {N, P}) ->
+               {[Other | N], [Other | P]}
+        end, {[], []}, State#state.args),
+    {State#state{query = lists:reverse(NQ2), args = lists:reverse(NA), need_array_pass = false},
+     State#state{query = lists:reverse(PQ2), args = lists:reverse(PA), need_array_pass = false}}.
 
 make_sql_query(State) ->
     Hash = erlang:phash2(State#state{loc = undefined, use_new_schema = true}),
@@ -437,7 +524,6 @@ parse_upsert(Fields) ->
                                  "a constant string"})
                   end
           end, {[], 0}, Fields),
-    %io:format("upsert ~p~n", [{Fields, Fs}]),
     Fs.
 
 %% key | {Update}
@@ -562,7 +648,11 @@ make_sql_upsert_insert(Table, ParseRes) ->
           ]),
     State.
 
-make_sql_upsert_pgsql901(Table, ParseRes) ->
+make_sql_upsert_pgsql901(Table, ParseRes0) ->
+    ParseRes = lists:map(
+        fun({"family", A2, A3}) -> {"\"family\"", A2, A3};
+           (Other) -> Other
+        end, ParseRes0),
     Update = make_sql_upsert_update(Table, ParseRes),
     Vals =
         lists:map(

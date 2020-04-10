@@ -8,7 +8,7 @@
 %%% Created : 30 Mar 2017 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -38,7 +38,10 @@
 	 compile_exprs/2, join_atoms/2, try_read_file/1, get_descr/2,
 	 css_dir/0, img_dir/0, js_dir/0, msgs_dir/0, sql_dir/0, lua_dir/0,
 	 read_css/1, read_img/1, read_js/1, read_lua/1, try_url/1,
-	 intersection/2, format_val/1, cancel_timer/1]).
+	 intersection/2, format_val/1, cancel_timer/1, unique_timestamp/0,
+	 is_mucsub_message/1, best_match/2, pmap/2, peach/2, format_exception/4,
+	 parse_ip_mask/1, match_ip_mask/3, format_hosts_list/1, format_cycle/1,
+	 delete_dir/1]).
 
 %% Deprecated functions
 -export([decode_base64/1, encode_base64/1]).
@@ -49,6 +52,8 @@
 -include("xmpp.hrl").
 -include_lib("kernel/include/file.hrl").
 
+-type distance_cache() :: #{{string(), string()} => non_neg_integer()}.
+
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -58,16 +63,18 @@ add_delay_info(Stz, From, Time) ->
 
 -spec add_delay_info(stanza(), jid(), erlang:timestamp(), binary()) -> stanza().
 add_delay_info(Stz, From, Time, Desc) ->
-    NewDelay = #delay{stamp = Time, from = From, desc = Desc},
-    case xmpp:get_subtag(Stz, #delay{stamp = {0,0,0}}) of
-	#delay{from = OldFrom} when is_record(OldFrom, jid) ->
-	    case jid:tolower(From) == jid:tolower(OldFrom) of
-		true ->
-		    Stz;
-		false ->
-		    xmpp:append_subtags(Stz, [NewDelay])
-	    end;
+    Delays = xmpp:get_subtags(Stz, #delay{stamp = {0,0,0}}),
+    Matching = lists:any(
+	fun(#delay{from = OldFrom}) when is_record(OldFrom, jid) ->
+	       jid:tolower(From) == jid:tolower(OldFrom);
+	   (_) ->
+	       false
+	end, Delays),
+    case Matching of
+	true ->
+	    Stz;
 	_ ->
+	    NewDelay = #delay{stamp = Time, from = From, desc = Desc},
 	    xmpp:append_subtags(Stz, [NewDelay])
     end.
 
@@ -107,6 +114,26 @@ unwrap_mucsub_message(#message{} = OuterMsg) ->
 	    false
     end;
 unwrap_mucsub_message(_Packet) ->
+    false.
+
+-spec is_mucsub_message(xmpp_element()) -> boolean().
+is_mucsub_message(#message{} = OuterMsg) ->
+    case xmpp:get_subtag(OuterMsg, #ps_event{}) of
+	#ps_event{
+	    items = #ps_items{
+		node = Node}}
+	    when Node == ?NS_MUCSUB_NODES_MESSAGES;
+		 Node == ?NS_MUCSUB_NODES_SUBJECT;
+		 Node == ?NS_MUCSUB_NODES_AFFILIATIONS;
+		 Node == ?NS_MUCSUB_NODES_CONFIG;
+		 Node == ?NS_MUCSUB_NODES_PARTICIPANTS;
+		 Node == ?NS_MUCSUB_NODES_PRESENCE;
+		 Node == ?NS_MUCSUB_NODES_SUBSCRIBERS ->
+	    true;
+	_ ->
+	    false
+    end;
+is_mucsub_message(_Packet) ->
     false.
 
 -spec is_standalone_chat_state(stanza()) -> boolean().
@@ -183,10 +210,10 @@ hex_to_base64(Hex) ->
 url_encode(A) ->
     url_encode(A, <<>>).
 
--spec expand_keyword(binary(), binary(), binary()) -> binary().
+-spec expand_keyword(iodata(), iodata(), iodata()) -> binary().
 expand_keyword(Keyword, Input, Replacement) ->
-    Parts = binary:split(Input, Keyword, [global]),
-    str:join(Parts, Replacement).
+    re:replace(Input, Keyword, Replacement,
+	       [{return, binary}, global]).
 
 binary_to_atom(Bin) ->
     erlang:binary_to_atom(Bin, utf8).
@@ -288,7 +315,7 @@ try_read_file(Path) ->
 	    file:close(Fd),
 	    iolist_to_binary(Path);
 	{error, Why} ->
-	    ?ERROR_MSG("Failed to read ~s: ~s", [Path, file:format_error(Why)]),
+	    ?ERROR_MSG("Failed to read ~ts: ~ts", [Path, file:format_error(Why)]),
 	    erlang:error(badarg)
     end.
 
@@ -303,15 +330,15 @@ try_url(URL0) ->
     end,
     case http_uri:parse(URL) of
 	{ok, {Scheme, _, _, _, _, _}} when Scheme /= http, Scheme /= https ->
-	    ?ERROR_MSG("Unsupported URI scheme: ~s", [URL]),
+	    ?ERROR_MSG("Unsupported URI scheme: ~ts", [URL]),
 	    erlang:error(badarg);
 	{ok, {_, _, Host, _, _, _}} when Host == ""; Host == <<"">> ->
-	    ?ERROR_MSG("Invalid URL: ~s", [URL]),
+	    ?ERROR_MSG("Invalid URL: ~ts", [URL]),
 	    erlang:error(badarg);
 	{ok, _} ->
 	    iolist_to_binary(URL);
 	{error, _} ->
-	    ?ERROR_MSG("Invalid URL: ~s", [URL]),
+	    ?ERROR_MSG("Invalid URL: ~ts", [URL]),
 	    erlang:error(badarg)
     end.
 
@@ -389,7 +416,7 @@ format_val(Term) ->
 	_ -> [io_lib:nl(), S]
     end.
 
--spec cancel_timer(reference()) -> ok.
+-spec cancel_timer(reference() | undefined) -> ok.
 cancel_timer(TRef) when is_reference(TRef) ->
     case erlang:cancel_timer(TRef) of
 	false ->
@@ -401,6 +428,159 @@ cancel_timer(TRef) when is_reference(TRef) ->
     end;
 cancel_timer(_) ->
     ok.
+
+-spec best_match(atom() | binary() | string(),
+		 [atom() | binary() | string()]) -> string().
+best_match(Pattern, []) ->
+    Pattern;
+best_match(Pattern, Opts) ->
+    String = to_string(Pattern),
+    {Ds, _} = lists:mapfoldl(
+		fun(Opt, Cache) ->
+			SOpt = to_string(Opt),
+			{Distance, Cache1} = ld(String, SOpt, Cache),
+			{{Distance, SOpt}, Cache1}
+		end, #{}, Opts),
+    element(2, lists:min(Ds)).
+
+-spec pmap(fun((T1) -> T2), [T1]) -> [T2].
+pmap(Fun, [_,_|_] = List) ->
+    case erlang:system_info(logical_processors) of
+	1 -> lists:map(Fun, List);
+	_ ->
+	    Self = self(),
+	    lists:map(
+	      fun({Pid, Ref}) ->
+		      receive
+			  {Pid, Ret} ->
+			      receive
+				  {'DOWN', Ref, _, _, _} ->
+				      Ret
+			      end;
+			  {'DOWN', Ref, _, _, Reason} ->
+			      exit(Reason)
+		      end
+	      end, [spawn_monitor(
+		      fun() -> Self ! {self(), Fun(X)} end)
+		    || X <- List])
+    end;
+pmap(Fun, List) ->
+    lists:map(Fun, List).
+
+-spec peach(fun((T) -> any()), [T]) -> ok.
+peach(Fun, [_,_|_] = List) ->
+    case erlang:system_info(logical_processors) of
+	1 -> lists:foreach(Fun, List);
+	_ ->
+	    Self = self(),
+	    lists:foreach(
+	      fun({Pid, Ref}) ->
+		      receive
+			  Pid ->
+			      receive
+				  {'DOWN', Ref, _, _, _} ->
+				      ok
+			      end;
+			  {'DOWN', Ref, _, _, Reason} ->
+			      exit(Reason)
+		      end
+	      end, [spawn_monitor(
+		      fun() -> Fun(X), Self ! self() end)
+		    || X <- List])
+    end;
+peach(Fun, List) ->
+    lists:foreach(Fun, List).
+
+-ifdef(HAVE_ERL_ERROR).
+format_exception(Level, Class, Reason, Stacktrace) ->
+    erl_error:format_exception(
+      Level, Class, Reason, Stacktrace,
+      fun(_M, _F, _A) -> false end,
+      fun(Term, I) ->
+	      io_lib:print(Term, I, 80, -1)
+      end).
+-else.
+format_exception(Level, Class, Reason, Stacktrace) ->
+    lib:format_exception(
+      Level, Class, Reason, Stacktrace,
+      fun(_M, _F, _A) -> false end,
+      fun(Term, I) ->
+	      io_lib:print(Term, I, 80, -1)
+      end).
+-endif.
+
+-spec parse_ip_mask(binary()) -> {ok, {inet:ip4_address(), 0..32}} |
+				 {ok, {inet:ip6_address(), 0..128}} |
+				 error.
+parse_ip_mask(S) ->
+    case econf:validate(econf:ip_mask(), S) of
+	{ok, _} = Ret -> Ret;
+	_ -> error
+    end.
+
+-spec match_ip_mask(inet:ip_address(), inet:ip_address(), 0..128) -> boolean().
+match_ip_mask({_, _, _, _} = IP, {_, _, _, _} = Net, Mask) ->
+    IPInt = ip_to_integer(IP),
+    NetInt = ip_to_integer(Net),
+    M = bnot (1 bsl (32 - Mask) - 1),
+    IPInt band M =:= NetInt band M;
+match_ip_mask({_, _, _, _, _, _, _, _} = IP,
+		{_, _, _, _, _, _, _, _} = Net, Mask) ->
+    IPInt = ip_to_integer(IP),
+    NetInt = ip_to_integer(Net),
+    M = bnot (1 bsl (128 - Mask) - 1),
+    IPInt band M =:= NetInt band M;
+match_ip_mask({_, _, _, _} = IP,
+		{0, 0, 0, 0, 0, 16#FFFF, _, _} = Net, Mask) ->
+    IPInt = ip_to_integer({0, 0, 0, 0, 0, 16#FFFF, 0, 0}) + ip_to_integer(IP),
+    NetInt = ip_to_integer(Net),
+    M = bnot (1 bsl (128 - Mask) - 1),
+    IPInt band M =:= NetInt band M;
+match_ip_mask({0, 0, 0, 0, 0, 16#FFFF, _, _} = IP,
+		{_, _, _, _} = Net, Mask) ->
+    IPInt = ip_to_integer(IP) - ip_to_integer({0, 0, 0, 0, 0, 16#FFFF, 0, 0}),
+    NetInt = ip_to_integer(Net),
+    M = bnot (1 bsl (32 - Mask) - 1),
+    IPInt band M =:= NetInt band M;
+match_ip_mask(_, _, _) ->
+    false.
+
+-spec format_hosts_list([binary(), ...]) -> iolist().
+format_hosts_list([Host]) ->
+    Host;
+format_hosts_list([H1, H2]) ->
+    [H1, " and ", H2];
+format_hosts_list([H1, H2, H3]) ->
+    [H1, ", ", H2, " and ", H3];
+format_hosts_list([H1, H2|Hs]) ->
+    io_lib:format("~ts, ~ts and ~B more hosts",
+		  [H1, H2, length(Hs)]).
+
+-spec format_cycle([atom(), ...]) -> iolist().
+format_cycle([M1]) ->
+    atom_to_list(M1);
+format_cycle([M1, M2]) ->
+    [atom_to_list(M1), " and ", atom_to_list(M2)];
+format_cycle([M|Ms]) ->
+    atom_to_list(M) ++ ", " ++ format_cycle(Ms).
+
+-spec delete_dir(file:filename_all()) -> ok | {error, file:posix()}.
+delete_dir(Dir) ->
+    try
+	{ok, Entries} = file:list_dir(Dir),
+	lists:foreach(fun(Path) ->
+			      case filelib:is_dir(Path) of
+				  true ->
+				      ok = delete_dir(Path);
+				  false ->
+				      ok = file:delete(Path)
+			      end
+		      end, [filename:join(Dir, Entry) || Entry <- Entries]),
+	ok = file:del_dir(Dir)
+    catch
+	_:{badmatch, {error, Error}} ->
+	    {error, Error}
+    end.
 
 %%%===================================================================
 %%% Internal functions
@@ -439,7 +619,7 @@ read_file(Path) ->
 	{ok, Data} ->
 	    {ok, Data};
 	{error, Why} = Err ->
-	    ?ERROR_MSG("Failed to read file ~s: ~s",
+	    ?ERROR_MSG("Failed to read file ~ts: ~ts",
 		       [Path, file:format_error(Why)]),
 	    Err
     end.
@@ -456,3 +636,43 @@ get_dir(Type) ->
 	Path ->
 	    Path
     end.
+
+%% Generates erlang:timestamp() that is guaranteed to unique
+-spec unique_timestamp() -> erlang:timestamp().
+unique_timestamp() ->
+    {MS, S, _} = erlang:timestamp(),
+    {MS, S, erlang:unique_integer([positive, monotonic]) rem 1000000}.
+
+%% Levenshtein distance
+-spec ld(string(), string(), distance_cache()) -> {non_neg_integer(), distance_cache()}.
+ld([] = S, T, Cache) ->
+    {length(T), maps:put({S, T}, length(T), Cache)};
+ld(S, [] = T, Cache) ->
+    {length(S), maps:put({S, T}, length(S), Cache)};
+ld([X|S], [X|T], Cache) ->
+    ld(S, T, Cache);
+ld([_|ST] = S, [_|TT] = T, Cache) ->
+    try {maps:get({S, T}, Cache), Cache}
+    catch _:{badkey, _} ->
+            {L1, C1} = ld(S, TT, Cache),
+            {L2, C2} = ld(ST, T, C1),
+            {L3, C3} = ld(ST, TT, C2),
+            L = 1 + lists:min([L1, L2, L3]),
+            {L, maps:put({S, T}, L, C3)}
+    end.
+
+-spec ip_to_integer(inet:ip_address()) -> non_neg_integer().
+ip_to_integer({IP1, IP2, IP3, IP4}) ->
+    IP1 bsl 8 bor IP2 bsl 8 bor IP3 bsl 8 bor IP4;
+ip_to_integer({IP1, IP2, IP3, IP4, IP5, IP6, IP7,
+	       IP8}) ->
+    IP1 bsl 16 bor IP2 bsl 16 bor IP3 bsl 16 bor IP4 bsl 16
+	bor IP5 bsl 16 bor IP6 bsl 16 bor IP7 bsl 16 bor IP8.
+
+-spec to_string(atom() | binary() | string()) -> string().
+to_string(A) when is_atom(A) ->
+    atom_to_list(A);
+to_string(B) when is_binary(B) ->
+    binary_to_list(B);
+to_string(S) ->
+    S.

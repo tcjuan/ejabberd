@@ -1,5 +1,5 @@
 --
--- ejabberd, Copyright (C) 2002-2017   ProcessOne
+-- ejabberd, Copyright (C) 2002-2020   ProcessOne
 --
 -- This program is free software; you can redistribute it and/or
 -- modify it under the terms of the GNU General Public License as
@@ -219,7 +219,7 @@ CREATE TABLE pubsub_node (
   nodeid bigint auto_increment primary key
 ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE INDEX i_pubsub_node_parent ON pubsub_node(parent(120));
-CREATE UNIQUE INDEX i_pubsub_node_tuple ON pubsub_node(host(20), node(120));
+CREATE UNIQUE INDEX i_pubsub_node_tuple ON pubsub_node(host(71), node(120));
 
 CREATE TABLE pubsub_node_option (
   nodeid bigint,
@@ -354,6 +354,13 @@ CREATE TABLE oauth_token (
     expire bigint NOT NULL
 ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+CREATE TABLE oauth_client (
+    client_id varchar(191) NOT NULL PRIMARY KEY,
+    client_name text NOT NULL,
+    grant_type text NOT NULL,
+    options text NOT NULL
+) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 CREATE TABLE route (
     domain text NOT NULL,
     server_host text NOT NULL,
@@ -372,16 +379,6 @@ CREATE TABLE bosh (
 ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE UNIQUE INDEX i_bosh_sid ON bosh(sid(75));
-
-CREATE TABLE carboncopy (
-    username text NOT NULL,
-    resource text NOT NULL,
-    namespace text NOT NULL,
-    node text NOT NULL
-) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-CREATE UNIQUE INDEX i_carboncopy_ur ON carboncopy (username(75), resource(75));
-CREATE INDEX i_carboncopy_user ON carboncopy (username(75));
 
 CREATE TABLE proxy65 (
     sid text NOT NULL,
@@ -405,3 +402,71 @@ CREATE TABLE push_session (
 
 CREATE UNIQUE INDEX i_push_usn ON push_session (username(191), service(191), node(191));
 CREATE UNIQUE INDEX i_push_ut ON push_session (username(191), timestamp);
+
+CREATE TABLE mix_channel (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    jid text NOT NULL,
+    hidden boolean NOT NULL,
+    hmac_key text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE UNIQUE INDEX i_mix_channel ON mix_channel (channel(191), service(191));
+CREATE INDEX i_mix_channel_serv ON mix_channel (service(191));
+
+CREATE TABLE mix_participant (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    jid text NOT NULL,
+    id text NOT NULL,
+    nick text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE UNIQUE INDEX i_mix_participant ON mix_participant (channel(191), service(191), username(191), domain(191));
+CREATE INDEX i_mix_participant_chan_serv ON mix_participant (channel(191), service(191));
+
+CREATE TABLE mix_subscription (
+    channel text NOT NULL,
+    service text NOT NULL,
+    username text NOT NULL,
+    domain text NOT NULL,
+    node text NOT NULL,
+    jid text NOT NULL
+) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE UNIQUE INDEX i_mix_subscription ON mix_subscription (channel(153), service(153), username(153), domain(153), node(153));
+CREATE INDEX i_mix_subscription_chan_serv_ud ON mix_subscription (channel(191), service(191), username(191), domain(191));
+CREATE INDEX i_mix_subscription_chan_serv_node ON mix_subscription (channel(191), service(191), node(191));
+CREATE INDEX i_mix_subscription_chan_serv ON mix_subscription (channel(191), service(191));
+
+CREATE TABLE mix_pam (
+    username text NOT NULL,
+    channel text NOT NULL,
+    service text NOT NULL,
+    id text NOT NULL,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE UNIQUE INDEX i_mix_pam ON mix_pam (username(191), channel(191), service(191));
+CREATE INDEX i_mix_pam_u ON mix_pam (username(191));
+
+CREATE TABLE mqtt_pub (
+    username varchar(191) NOT NULL,
+    resource varchar(191) NOT NULL,
+    topic text NOT NULL,
+    qos tinyint NOT NULL,
+    payload blob NOT NULL,
+    payload_format tinyint NOT NULL,
+    content_type text NOT NULL,
+    response_topic text NOT NULL,
+    correlation_data blob NOT NULL,
+    user_properties blob NOT NULL,
+    expiry int unsigned NOT NULL,
+    UNIQUE KEY i_mqtt_topic (topic(191))
+);

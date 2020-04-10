@@ -5,7 +5,7 @@
 %%% Created : 22 Oct 2015 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,9 +30,10 @@
 
 -include("logger.hrl").
 -include("xmpp.hrl").
+-include("translate.hrl").
 
 -export([start/2, stop/1, mod_opt_type/1, mod_options/1, depends/2, reload/3]).
-
+-export([push/2, mod_doc/0]).
 -export([offline_message_hook/1,
          sm_register_connection_hook/3, sm_remove_connection_hook/3,
          user_send_packet/1, user_receive_packet/1,
@@ -41,6 +42,8 @@
 
 -define(SOCKET_NAME, mod_metrics_udp_socket).
 -define(SOCKET_REGISTER_RETRIES, 10).
+
+-type probe() :: atom() | {atom(), integer()}.
 
 %%====================================================================
 %% API
@@ -124,12 +127,14 @@ register_user(_User, Server) ->
 %%====================================================================
 %% metrics push handler
 %%====================================================================
-
+-spec push(binary(), probe()) -> ok | {error, not_owner | inet:posix()}.
 push(Host, Probe) ->
-    IP = gen_mod:get_module_opt(Host, ?MODULE, ip),
-    Port = gen_mod:get_module_opt(Host, ?MODULE, port),
+    IP = mod_metrics_opt:ip(Host),
+    Port = mod_metrics_opt:port(Host),
     send_metrics(Host, Probe, IP, Port).
 
+-spec send_metrics(binary(), probe(), inet:ip4_address(), inet:port_number()) ->
+			  ok | {error, not_owner | inet:posix()}.
 send_metrics(Host, Probe, Peer, Port) ->
     % our default metrics handler is https://github.com/processone/grapherl
     % grapherl metrics are named first with service domain, then nodename
@@ -138,7 +143,7 @@ send_metrics(Host, Probe, Peer, Port) ->
     [_, FQDN] = binary:split(misc:atom_to_binary(node()), <<"@">>),
     [Node|_] = binary:split(FQDN, <<".">>),
     BaseId = <<Host/binary, "/", Node/binary, ".">>,
-    TS = integer_to_binary(p1_time_compat:system_time(seconds)),
+    TS = integer_to_binary(erlang:system_time(second)),
     case get_socket(?SOCKET_REGISTER_RETRIES) of
 	{ok, Socket} ->
 	    case Probe of
@@ -156,6 +161,7 @@ send_metrics(Host, Probe, Peer, Port) ->
 	    Err
     end.
 
+-spec get_socket(integer()) -> {ok, gen_udp:socket()} | {error, inet:posix()}.
 get_socket(N) ->
     case whereis(?SOCKET_NAME) of
 	undefined ->
@@ -168,7 +174,7 @@ get_socket(N) ->
 			    get_socket(N-1)
 		    end;
 		{error, Reason} = Err ->
-		    ?ERROR_MSG("can not open udp socket to grapherl: ~s",
+		    ?ERROR_MSG("Can not open udp socket to grapherl: ~ts",
 			       [inet:format_error(Reason)]),
 		    Err
 	    end;
@@ -177,13 +183,38 @@ get_socket(N) ->
     end.
 
 mod_opt_type(ip) ->
-    fun(S) ->
-	    {ok, IP} = inet:parse_ipv4_address(
-			 binary_to_list(iolist_to_binary(S))),
-	    IP
-    end;
+    econf:ipv4();
 mod_opt_type(port) ->
-    fun(I) when is_integer(I), I>0, I<65536 -> I end.
+    econf:port().
 
 mod_options(_) ->
-    [{ip, <<"127.0.0.1">>}, {port, 11111}].
+    [{ip, {127,0,0,1}}, {port, 11111}].
+
+mod_doc() ->
+    #{desc =>
+          [?T("This module sends events to external backend "
+              "(by now only https://github.com/processone/grapherl"
+              "[grapherl] is supported). Supported events are:"), "",
+           "- sm_register_connection", "",
+           "- sm_remove_connection", "",
+           "- user_send_packet", "",
+           "- user_receive_packet", "",
+           "- s2s_send_packet", "",
+           "- s2s_receive_packet", "",
+           "- register_user", "",
+           "- remove_user", "",
+           "- offline_message", "",
+           ?T("When enabled, every call to these hooks triggers "
+              "a counter event to be sent to the external backend.")],
+      opts =>
+          [{ip,
+            #{value => ?T("IPv4Address"),
+              desc =>
+                  ?T("IPv4 address where the backend is located. "
+                     "The default value is '127.0.0.1'.")}},
+           {port,
+            #{value => ?T("Port"),
+              desc =>
+                  ?T("An internet port number at which the backend "
+                     "is listening for incoming connections/packets. "
+                     "The default value is '11111'.")}}]}.

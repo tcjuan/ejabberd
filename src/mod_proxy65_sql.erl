@@ -3,7 +3,7 @@
 %%% Created : 30 Mar 2017 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -23,7 +23,6 @@
 -module(mod_proxy65_sql).
 -behaviour(mod_proxy65).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/0, register_stream/2, unregister_stream/1, activate_stream/4]).
@@ -44,7 +43,7 @@ init() ->
 	{updated, _} ->
 	    ok;
 	Err ->
-	    ?ERROR_MSG("failed to clean 'proxy65' table: ~p", [Err]),
+	    ?ERROR_MSG("Failed to clean 'proxy65' table: ~p", [Err]),
 	    Err
     end.
 

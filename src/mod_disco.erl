@@ -5,7 +5,7 @@
 %%% Created :  1 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -37,8 +37,8 @@
 	 get_local_features/5, get_local_services/5,
 	 process_sm_iq_items/1, process_sm_iq_info/1,
 	 get_sm_identity/5, get_sm_features/5, get_sm_items/5,
-	 get_info/5, transform_module_options/1, mod_opt_type/1,
-	 mod_options/1, depends/2]).
+	 get_info/5, mod_opt_type/1, mod_options/1, depends/2,
+         mod_doc/0]).
 
 -include("logger.hrl").
 -include("translate.hrl").
@@ -48,6 +48,7 @@
 
 -type features_acc() :: {error, stanza_error()} | {result, [binary()]} | empty.
 -type items_acc() :: {error, stanza_error()} | {result, [disco_item()]} | empty.
+-export_type([features_acc/0, items_acc/0]).
 
 start(Host, Opts) ->
     gen_iq_handler:add_iq_handler(ejabberd_local, Host,
@@ -63,7 +64,7 @@ start(Host, Opts) ->
     catch ets:new(disco_extra_domains,
 		  [named_table, ordered_set, public,
 		   {heir, erlang:group_leader(), none}]),
-    ExtraDomains = gen_mod:get_opt(extra_domains, Opts),
+    ExtraDomains = mod_disco_opt:extra_domains(Opts),
     lists:foreach(fun (Domain) ->
 			  register_extra_domain(Host, Domain)
 		  end,
@@ -112,19 +113,16 @@ stop(Host) ->
     ok.
 
 reload(Host, NewOpts, OldOpts) ->
-    case gen_mod:is_equal_opt(extra_domains, NewOpts, OldOpts) of
-	{false, NewDomains, OldDomains} ->
-	    lists:foreach(
-	      fun(Domain) ->
-		      register_extra_domain(Host, Domain)
-	      end, NewDomains -- OldDomains),
-	    lists:foreach(
-	      fun(Domain) ->
-		      unregister_extra_domain(Host, Domain)
-	      end, OldDomains -- NewDomains);
-	true ->
-	    ok
-    end.
+    NewDomains = mod_disco_opt:extra_domains(NewOpts),
+    OldDomains = mod_disco_opt:extra_domains(OldOpts),
+    lists:foreach(
+      fun(Domain) ->
+	      register_extra_domain(Host, Domain)
+      end, NewDomains -- OldDomains),
+    lists:foreach(
+      fun(Domain) ->
+	      unregister_extra_domain(Host, Domain)
+      end, OldDomains -- NewDomains).
 
 -spec register_extra_domain(binary(), binary()) -> true.
 register_extra_domain(Host, Domain) ->
@@ -136,7 +134,7 @@ unregister_extra_domain(Host, Domain) ->
 
 -spec process_local_iq_items(iq()) -> iq().
 process_local_iq_items(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_local_iq_items(#iq{type = get, lang = Lang,
 			   from = From, to = To,
@@ -152,7 +150,7 @@ process_local_iq_items(#iq{type = get, lang = Lang,
 
 -spec process_local_iq_info(iq()) -> iq().
 process_local_iq_info(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_local_iq_info(#iq{type = get, lang = Lang,
 			  from = From, to = To,
@@ -177,7 +175,7 @@ process_local_iq_info(#iq{type = get, lang = Lang,
 			 binary(), binary()) ->	[identity()].
 get_local_identity(Acc, _From, To, <<"">>, _Lang) ->
     Host = To#jid.lserver,
-    Name = gen_mod:get_module_opt(Host, ?MODULE, name),
+    Name = mod_disco_opt:name(Host),
     Acc ++ [#identity{category = <<"server">>,
 		      type = <<"im">>,
 		      name = Name}];
@@ -203,7 +201,7 @@ get_local_features(Acc, _From, _To, _Node, Lang) ->
     case Acc of
       {result, _Features} -> Acc;
       empty ->
-	    Txt = <<"No features available">>,
+	    Txt = ?T("No features available"),
 	    {error, xmpp:err_item_not_found(Txt, Lang)}
     end.
 
@@ -231,14 +229,14 @@ get_local_services({result, _} = Acc, _From, _To, _Node,
 		   _Lang) ->
     Acc;
 get_local_services(empty, _From, _To, _Node, Lang) ->
-    {error, xmpp:err_item_not_found(<<"No services available">>, Lang)}.
+    {error, xmpp:err_item_not_found(?T("No services available"), Lang)}.
 
 -spec get_vh_services(binary()) -> [binary()].
 get_vh_services(Host) ->
     Hosts = lists:sort(fun (H1, H2) ->
 			       byte_size(H1) >= byte_size(H2)
 		       end,
-		       ejabberd_config:get_myhosts()),
+		       ejabberd_option:hosts()),
     lists:filter(fun (H) ->
 			 case lists:dropwhile(fun (VH) ->
 						      not
@@ -258,7 +256,7 @@ get_vh_services(Host) ->
 
 -spec process_sm_iq_items(iq()) -> iq().
 process_sm_iq_items(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_sm_iq_items(#iq{type = get, lang = Lang,
 			from = From, to = To,
@@ -275,7 +273,7 @@ process_sm_iq_items(#iq{type = get, lang = Lang,
 		    xmpp:make_error(IQ, Error)
 	    end;
 	false ->
-	    Txt = <<"Not subscribed">>,
+	    Txt = ?T("Not subscribed"),
 	    xmpp:make_error(IQ, xmpp:err_subscription_required(Txt, Lang))
     end.
 
@@ -304,13 +302,13 @@ get_sm_items(empty, From, To, _Node, Lang) ->
     case {LFrom, LSFrom} of
       {LTo, LSTo} -> {error, xmpp:err_item_not_found()};
       _ ->
-	    Txt = <<"Query to another users is forbidden">>,
+	    Txt = ?T("Query to another users is forbidden"),
 	    {error, xmpp:err_not_allowed(Txt, Lang)}
     end.
 
 -spec process_sm_iq_info(iq()) -> iq().
 process_sm_iq_info(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_sm_iq_info(#iq{type = get, lang = Lang,
 		       from = From, to = To,
@@ -334,7 +332,7 @@ process_sm_iq_info(#iq{type = get, lang = Lang,
 		    xmpp:make_error(IQ, Error)
 	    end;
 	false ->
-	    Txt = <<"Not subscribed">>,
+	    Txt = ?T("Not subscribed"),
 	    xmpp:make_error(IQ, xmpp:err_subscription_required(Txt, Lang))
     end.
 
@@ -361,7 +359,7 @@ get_sm_features(empty, From, To, Node, Lang) ->
 		_ -> {error, xmpp:err_item_not_found()}
 	    end;
 	_ ->
-	    Txt = <<"Query to another users is forbidden">>,
+	    Txt = ?T("Query to another users is forbidden"),
 	    {error, xmpp:err_not_allowed(Txt, Lang)}
     end;
 get_sm_features({result, Features}, _From, _To, <<"">>, _Lang) ->
@@ -373,23 +371,6 @@ get_user_resources(User, Server) ->
     Rs = ejabberd_sm:get_user_resources(User, Server),
     [#disco_item{jid = jid:make(User, Server, Resource), name = User}
      || Resource <- lists:sort(Rs)].
-
--spec transform_module_options(gen_mod:opts()) -> gen_mod:opts().
-transform_module_options(Opts) ->
-    lists:map(
-      fun({server_info, Infos}) ->
-              NewInfos = lists:map(
-                           fun({Modules, Name, URLs}) ->
-                                   [[{modules, Modules},
-                                     {name, Name},
-                                     {urls, URLs}]];
-                              (Opt) ->
-                                   Opt
-                           end, Infos),
-              {server_info, NewInfos};
-         (Opt) ->
-              Opt
-      end, Opts).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -411,7 +392,7 @@ get_info(Acc, _, _, _Node, _) -> Acc.
 
 -spec get_fields(binary(), module()) -> [xdata_field()].
 get_fields(Host, Module) ->
-    Fields = gen_mod:get_module_opt(Host, ?MODULE, server_info),
+    Fields = mod_disco_opt:server_info(Host),
     Fields1 = lists:filter(fun ({Modules, _, _}) ->
 				   case Modules of
 				       all -> true;
@@ -429,20 +410,97 @@ depends(_Host, _Opts) ->
     [].
 
 mod_opt_type(extra_domains) ->
-    fun (Hs) -> [iolist_to_binary(H) || H <- Hs] end;
-mod_opt_type(name) -> fun iolist_to_binary/1;
+    econf:list(econf:binary());
+mod_opt_type(name) ->
+    econf:binary();
 mod_opt_type(server_info) ->
-    fun (L) ->
-	    lists:map(fun (Opts) ->
-			      Mods = proplists:get_value(modules, Opts, all),
-			      Name = proplists:get_value(name, Opts, <<>>),
-			      URLs = proplists:get_value(urls, Opts, []),
-			      {Mods, Name, URLs}
-		      end,
-		      L)
-    end.
+    econf:list(
+      econf:and_then(
+	econf:options(
+	  #{name => econf:binary(),
+	    urls => econf:list(econf:binary()),
+	    modules =>
+		econf:either(
+		  all,
+		  econf:list(econf:beam()))}),
+	fun(Opts) ->
+		Mods = proplists:get_value(modules, Opts, all),
+		Name = proplists:get_value(name, Opts, <<>>),
+		URLs = proplists:get_value(urls, Opts, []),
+		{Mods, Name, URLs}
+	end)).
 
+-spec mod_options(binary()) -> [{server_info,
+				 [{all | [module()], binary(), [binary()]}]} |
+				{atom(), any()}].
 mod_options(_Host) ->
     [{extra_domains, []},
      {server_info, []},
      {name, ?T("ejabberd")}].
+
+mod_doc() ->
+    #{desc =>
+          ?T("This module adds support for "
+             "https://xmpp.org/extensions/xep-0030.html"
+             "[XEP-0030: Service Discovery]. With this module enabled, "
+             "services on your server can be discovered by XMPP clients."),
+      opts =>
+          [{extra_domains,
+            #{value => "[Domain, ...]",
+              desc =>
+                  ?T("With this option, you can specify a list of extra "
+                     "domains that are added to the Service Discovery item list. "
+                     "The default value is an empty list.")}},
+           {name,
+            #{value => ?T("Name"),
+              desc =>
+                  ?T("A name of the server in the Service Discovery. "
+                     "This will only be displayed by special XMPP clients. "
+                     "The default value is 'ejabberd'.")}},
+           {server_info,
+            #{value => "[Info, ...]",
+              example =>
+                  ["server_info:",
+                   "  -",
+                   "    modules: all",
+                   "    name: abuse-addresses",
+                   "    urls: [mailto:abuse@shakespeare.lit]",
+                   "  -",
+                   "    modules: [mod_muc]",
+                   "    name: \"Web chatroom logs\"",
+                   "    urls: [http://www.example.org/muc-logs]",
+                   "  -",
+                   "    modules: [mod_disco]",
+                   "    name: feedback-addresses",
+                   "    urls:",
+                   "      - http://shakespeare.lit/feedback.php",
+                   "      - mailto:feedback@shakespeare.lit",
+                   "      - xmpp:feedback@shakespeare.lit",
+                   "  -",
+                   "    modules:",
+                   "      - mod_disco",
+                   "      - mod_vcard",
+                   "    name: admin-addresses",
+                   "    urls:",
+                   "      - mailto:xmpp@shakespeare.lit",
+                   "      - xmpp:admins@shakespeare.lit"],
+              desc =>
+                  ?T("Specify additional information about the server, "
+                     "as described in https://xmpp.org/extensions/xep-0157.html"
+                     "[XEP-0157: Contact Addresses for XMPP Services]. Every 'Info' "
+                     "element in the list is constructed from the following options:")},
+            [{modules,
+              #{value => "all | [Module, ...]",
+                desc =>
+                    ?T("The value can be the keyword 'all', in which case the "
+                       "information is reported in all the services, "
+                       "or a list of ejabberd modules, in which case the "
+                       "information is only specified for the services provided "
+                       "by those modules.")}},
+             {name,
+              #{value => ?T("Name"),
+                desc => ?T("Any arbitrary name of the contact.")}},
+             {urls,
+              #{value => "[URI, ...]",
+                desc => ?T("A list of contact URIs, such as "
+                           "HTTP URLs, XMPP URIs and so on.")}}]}]}.

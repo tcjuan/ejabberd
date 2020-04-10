@@ -5,7 +5,7 @@
 %%% Created : 26 Jul 2016 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,13 +26,13 @@
 
 -module(ejabberd_oauth_rest).
 -behaviour(ejabberd_oauth).
--behaviour(ejabberd_config).
 
 -export([init/0,
          store/1,
          lookup/1,
          clean/1,
-         opt_type/1]).
+         lookup_client/1,
+         store_client/1]).
 
 -include("ejabberd_oauth.hrl").
 -include("logger.hrl").
@@ -58,7 +58,7 @@ store(R) ->
         {ok, Code, _} when Code == 200 orelse Code == 201 ->
             ok;
         Err ->
-            ?ERROR_MSG("failed to store oauth record ~p: ~p", [R, Err]),
+            ?ERROR_MSG("Failed to store oauth record ~p: ~p", [R, Err]),
             {error, db_failure}
     end.
 
@@ -88,11 +88,62 @@ clean(_TS) ->
     ok.
 
 path(Path) ->
-    Base = ejabberd_config:get_option(ext_api_path_oauth, <<"/oauth">>),
+    Base = ejabberd_option:ext_api_path_oauth(),
     <<Base/binary, "/", Path/binary>>.
 
+store_client(#oauth_client{client_id = ClientID,
+                           client_name = ClientName,
+                           grant_type = GrantType,
+                           options = Options} = R) ->
+    Path = path(<<"store_client">>),
+    SGrantType =
+        case GrantType of
+            password -> <<"password">>;
+            implicit -> <<"implicit">>
+        end,
+    SOptions = misc:term_to_base64(Options),
+    %% Retry 2 times, with a backoff of 500millisec
+    case rest:with_retry(
+           post,
+           [ejabberd_config:get_myname(), Path, [],
+            {[{<<"client_id">>, ClientID},
+              {<<"client_name">>, ClientName},
+              {<<"grant_type">>, SGrantType},
+              {<<"options">>, SOptions}
+             ]}], 2, 500) of
+        {ok, Code, _} when Code == 200 orelse Code == 201 ->
+            ok;
+        Err ->
+            ?ERROR_MSG("Failed to store oauth record ~p: ~p", [R, Err]),
+            {error, db_failure}
+    end.
 
--spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
-opt_type(ext_api_path_oauth) ->
-    fun (X) -> iolist_to_binary(X) end;
-opt_type(_) -> [ext_api_path_oauth].
+lookup_client(ClientID) ->
+    Path = path(<<"lookup_client">>),
+    case rest:with_retry(post, [ejabberd_config:get_myname(), Path, [],
+                                {[{<<"client_id">>, ClientID}]}],
+                         2, 500) of
+        {ok, 200, {Data}} ->
+            ClientName = proplists:get_value(<<"client_name">>, Data, <<>>),
+            SGrantType = proplists:get_value(<<"grant_type">>, Data, <<>>),
+            GrantType =
+                case SGrantType of
+                    <<"password">> -> password;
+                    <<"implicit">> -> implicit
+                end,
+            SOptions = proplists:get_value(<<"options">>, Data, <<>>),
+            case misc:base64_to_term(SOptions) of
+                {term, Options} ->
+                    {ok, #oauth_client{client_id = ClientID,
+                                       client_name = ClientName,
+                                       grant_type = GrantType,
+                                       options = Options}};
+                _ ->
+                    error
+            end;
+        {ok, 404, _Resp} ->
+            error;
+        Other ->
+            ?ERROR_MSG("Unexpected response for oauth lookup: ~p", [Other]),
+	    error
+    end.

@@ -5,7 +5,7 @@
 %%% Created :  9 Aug 2017 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -29,7 +29,7 @@
 -behaviour(gen_mod).
 
 -export([start/2, stop/1, reload/3, mod_options/1,
-         get_commands_spec/0, depends/2]).
+         get_commands_spec/0, depends/2, mod_doc/0]).
 
 % Commands API
 -export([update_sql/0]).
@@ -39,6 +39,7 @@
 -include("ejabberd_commands.hrl").
 -include("xmpp.hrl").
 -include("ejabberd_sql_pt.hrl").
+-include("translate.hrl").
 
 %%%
 %%% gen_mod
@@ -75,14 +76,13 @@ get_commands_spec() ->
 update_sql() ->
     lists:foreach(
       fun(Host) ->
-              case ejabberd_sql_sup:get_pids(Host) of
-                  [] ->
+              case ejabberd_sql_sup:is_started(Host) of
+                  false ->
                       ok;
-                  _ ->
+                  true ->
                       update_sql(Host)
               end
-      end, ejabberd_config:get_myhosts()),
-    ok.
+      end, ejabberd_option:hosts()).
 
 -record(state, {host :: binary(),
                 dbtype :: mysql | pgsql | sqlite | mssql | odbc,
@@ -90,7 +90,7 @@ update_sql() ->
 
 update_sql(Host) ->
     LHost = jid:nameprep(Host),
-    DBType = ejabberd_config:get_option({sql_type, LHost}, undefined),
+    DBType = ejabberd_option:sql_type(LHost),
     IsSupported =
         case DBType of
             pgsql -> true;
@@ -349,7 +349,7 @@ create_index(#state{dbtype = mysql} = State, Table, Index, Cols) ->
        SCols, ");"]).
 
 sql_query(Host, Query) ->
-    io:format("executing \"~s\" on ~s~n", [Query, Host]),
+    io:format("executing \"~ts\" on ~ts~n", [Query, Host]),
     case ejabberd_sql:sql_query(Host, Query) of
         {error, Error} ->
             io:format("error: ~p~n", [Error]),
@@ -359,3 +359,9 @@ sql_query(Host, Query) ->
     end.
 
 mod_options(_) -> [].
+
+mod_doc() ->
+    #{desc =>
+          ?T("This module can be used to update existing SQL database "
+             "from 'old' to 'new' schema. When the module is loaded "
+             "use 'update_sql' ejabberdctl command.")}.

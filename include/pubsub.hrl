@@ -1,6 +1,6 @@
 %%%----------------------------------------------------------------------
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,8 +26,8 @@
 -define(MAXITEMS, 10).
 
 %% this is currently a hard limit.
-%% Would be nice to have it configurable. 
--define(MAX_PAYLOAD_SIZE, 60000).
+%% Would be nice to have it configurable.
+-define(MAX_PAYLOAD_SIZE, 250000).
 
 %% -------------------------------
 %% Pubsub types
@@ -58,7 +58,7 @@
 %% note: pos_integer() should always be used, but we allow anything else coded
 %% as binary, so one can have a custom implementation of nodetree with custom
 %% indexing (see nodetree_virtual). this also allows to use any kind of key for
-%% indexing nodes, as this can be usefull with external backends such as sql.
+%% indexing nodes, as this can be useful with external backends such as sql.
 
 -type(itemId() :: binary()).
 %% @type itemId() = string().
@@ -84,7 +84,7 @@
      Value::binary() | [binary()] | boolean()
 }).
 
--type(subOptions() :: [mod_pubsub:subOption(),...]).
+-type(subOptions() :: [mod_pubsub:subOption()]).
 
 -type(pubOption() ::
     {Option::binary(),

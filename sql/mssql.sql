@@ -1,5 +1,5 @@
 --
--- ejabberd, Copyright (C) 2002-2017   ProcessOne
+-- ejabberd, Copyright (C) 2002-2020   ProcessOne
 --
 -- This program is free software; you can redistribute it and/or
 -- modify it under the terms of the GNU General Public License as
@@ -26,8 +26,8 @@ CREATE TABLE [dbo].[archive] (
         [timestamp] [bigint] NOT NULL,
         [peer] [varchar] (250) NOT NULL,
         [bare_peer] [varchar] (250) NOT NULL,
-        [xml] [text] NOT NULL,
-        [txt] [text] NULL,
+        [xml] [ntext] NOT NULL,
+        [txt] [ntext] NULL,
         [id] [bigint] IDENTITY(1,1) NOT NULL,
         [kind] [varchar] (10) NULL,
         [nick] [varchar] (250) NULL,
@@ -530,19 +530,6 @@ CREATE TABLE [dbo].[bosh] (
         [sid] ASC
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON)
 );
-
-CREATE TABLE [dbo].[carboncopy] (
-    [username] [varchar] (255) NOT NULL,
-    [resource] [varchar] (255) NOT NULL,
-    [namespace] [varchar] (255) NOT NULL,
-    [node] [varchar] (255) NOT NULL
-);
-
-CREATE UNIQUE CLUSTERED INDEX [carboncopy_ur] ON [carboncopy] (username, resource)
-WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON);
-
-CREATE INDEX [carboncopy_user] ON [carboncopy] (username)
-WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON);
 
 CREATE TABLE [dbo].[push_session] (
     [username] [varchar] (255) NOT NULL,

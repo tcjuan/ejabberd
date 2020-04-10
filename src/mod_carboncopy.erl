@@ -7,7 +7,7 @@
 %%%              {mod_carboncopy, []}
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -35,41 +35,27 @@
 -export([start/2, stop/1, reload/3]).
 
 -export([user_send_packet/1, user_receive_packet/1,
-	 iq_handler/1, remove_connection/4, disco_features/5,
-	 is_carbon_copy/1, mod_opt_type/1, depends/2, clean_cache/1,
-	 mod_options/1]).
+	 iq_handler/1, disco_features/5,
+	 depends/2, mod_options/1, mod_doc/0]).
+-export([c2s_copy_session/2, c2s_session_opened/1, c2s_session_resumed/1]).
+%% For debugging purposes
+-export([list/2]).
 
 -include("logger.hrl").
 -include("xmpp.hrl").
--include("mod_carboncopy.hrl").
+-include("translate.hrl").
 
 -type direction() :: sent | received.
+-type c2s_state() :: ejabberd_c2s:state().
 
--callback init(binary(), gen_mod:opts()) -> any().
--callback enable(binary(), binary(), binary(), binary()) -> ok | {error, any()}.
--callback disable(binary(), binary(), binary()) -> ok | {error, any()}.
--callback list(binary(), binary()) -> [{binary(), binary(), node()}].
--callback use_cache(binary()) -> boolean().
--callback cache_nodes(binary()) -> [node()].
-
--optional_callbacks([use_cache/1, cache_nodes/1]).
-
--spec is_carbon_copy(stanza()) -> boolean().
-is_carbon_copy(#message{meta = #{carbon_copy := true}}) ->
-    true;
-is_carbon_copy(_) ->
-    false.
-
-start(Host, Opts) ->
+start(Host, _Opts) ->
     ejabberd_hooks:add(disco_local_features, Host, ?MODULE, disco_features, 50),
-    Mod = gen_mod:ram_db_mod(Host, ?MODULE),
-    init_cache(Mod, Host, Opts),
-    Mod:init(Host, Opts),
-    clean_cache(),
-    ejabberd_hooks:add(unset_presence_hook,Host, ?MODULE, remove_connection, 10),
     %% why priority 89: to define clearly that we must run BEFORE mod_logdb hook (90)
     ejabberd_hooks:add(user_send_packet,Host, ?MODULE, user_send_packet, 89),
     ejabberd_hooks:add(user_receive_packet,Host, ?MODULE, user_receive_packet, 89),
+    ejabberd_hooks:add(c2s_copy_session, Host, ?MODULE, c2s_copy_session, 50),
+    ejabberd_hooks:add(c2s_session_resumed, Host, ?MODULE, c2s_session_resumed, 50),
+    ejabberd_hooks:add(c2s_session_opened, Host, ?MODULE, c2s_session_opened, 50),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_CARBONS_2, ?MODULE, iq_handler).
 
 stop(Host) ->
@@ -78,32 +64,20 @@ stop(Host) ->
     %% why priority 89: to define clearly that we must run BEFORE mod_logdb hook (90)
     ejabberd_hooks:delete(user_send_packet,Host, ?MODULE, user_send_packet, 89),
     ejabberd_hooks:delete(user_receive_packet,Host, ?MODULE, user_receive_packet, 89),
-    ejabberd_hooks:delete(unset_presence_hook,Host, ?MODULE, remove_connection, 10).
+    ejabberd_hooks:delete(c2s_copy_session, Host, ?MODULE, c2s_copy_session, 50),
+    ejabberd_hooks:delete(c2s_session_resumed, Host, ?MODULE, c2s_session_resumed, 50),
+    ejabberd_hooks:delete(c2s_session_opened, Host, ?MODULE, c2s_session_opened, 50).
 
-reload(Host, NewOpts, OldOpts) ->
-    NewMod = gen_mod:ram_db_mod(Host, NewOpts, ?MODULE),
-    OldMod = gen_mod:ram_db_mod(Host, OldOpts, ?MODULE),
-    if NewMod /= OldMod ->
-	    NewMod:init(Host, NewOpts);
-       true ->
-	    ok
-    end,
-    case use_cache(NewMod, Host) of
-	true ->
-	    ets_cache:new(?CARBONCOPY_CACHE, cache_opts(NewOpts));
-	false ->
-	    ok
-    end.
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
 
 -spec disco_features({error, stanza_error()} | {result, [binary()]} | empty,
 		     jid(), jid(), binary(), binary()) ->
 			    {error, stanza_error()} | {result, [binary()]}.
-disco_features({error, Err}, _From, _To, _Node, _Lang) ->
-    {error, Err};
-disco_features(empty, _From, _To, <<"">>, _Lang) ->
-    {result, [?NS_CARBONS_2]};
+disco_features(empty, From, To, <<"">>, Lang) ->
+    disco_features({result, []}, From, To, <<"">>, Lang);
 disco_features({result, Feats}, _From, _To, <<"">>, _Lang) ->
-    {result, [?NS_CARBONS_2|Feats]};
+    {result, [?NS_CARBONS_2,?NS_CARBONS_RULES_0|Feats]};
 disco_features(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
@@ -113,83 +87,90 @@ iq_handler(#iq{type = set, lang = Lang, from = From,
 					  is_record(El, carbons_disable) ->
     {U, S, R} = jid:tolower(From),
     Result = case El of
-		 #carbons_enable{} ->
-		     ?DEBUG("Carbons enabled for user ~s@~s/~s", [U,S,R]),
-		     enable(S, U, R, ?NS_CARBONS_2);
-		 #carbons_disable{} ->
-		     ?DEBUG("Carbons disabled for user ~s@~s/~s", [U,S,R]),
-		     disable(S, U, R)
+		 #carbons_enable{} -> enable(S, U, R, ?NS_CARBONS_2);
+		 #carbons_disable{} -> disable(S, U, R)
 	     end,
     case Result of
 	ok ->
-	    ?DEBUG("carbons IQ result: ok", []),
 	    xmpp:make_iq_result(IQ);
-	{error,_Error} ->
-	    ?ERROR_MSG("Error enabling / disabling carbons: ~p", [Result]),
-	    Txt = <<"Database failure">>,
+	{error, _} ->
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end;
 iq_handler(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Only <enable/> or <disable/> tags are allowed">>,
+    Txt = ?T("Only <enable/> or <disable/> tags are allowed"),
     xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
 iq_handler(#iq{type = get, lang = Lang} = IQ)->
-    Txt = <<"Value 'get' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'get' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang)).
 
 -spec user_send_packet({stanza(), ejabberd_c2s:state()})
       -> {stanza(), ejabberd_c2s:state()} | {stop, {stanza(), ejabberd_c2s:state()}}.
-user_send_packet({Packet, C2SState}) ->
-    From = xmpp:get_from(Packet),
-    To = xmpp:get_to(Packet),
-    case check_and_forward(From, To, Packet, sent) of
-	{stop, Pkt} -> {stop, {Pkt, C2SState}};
-	Pkt -> {Pkt, C2SState}
-    end.
+user_send_packet({#message{meta = #{carbon_copy := true}}, _C2SState} = Acc) ->
+    %% Stop the hook chain, we don't want logging modules to duplicate this
+    %% message.
+    {stop, Acc};
+user_send_packet({#message{from = From, to = To} = Msg, C2SState}) ->
+    {check_and_forward(From, To, Msg, sent), C2SState};
+user_send_packet(Acc) ->
+    Acc.
 
 -spec user_receive_packet({stanza(), ejabberd_c2s:state()})
       -> {stanza(), ejabberd_c2s:state()} | {stop, {stanza(), ejabberd_c2s:state()}}.
-user_receive_packet({Packet, #{jid := JID} = C2SState}) ->
-    To = xmpp:get_to(Packet),
-    case check_and_forward(JID, To, Packet, received) of
-	{stop, Pkt} -> {stop, {Pkt, C2SState}};
-	Pkt -> {Pkt, C2SState}
+user_receive_packet({#message{meta = #{carbon_copy := true}}, _C2SState} = Acc) ->
+    %% Stop the hook chain, we don't want logging modules to duplicate this
+    %% message.
+    {stop, Acc};
+user_receive_packet({#message{to = To} = Msg, #{jid := JID} = C2SState}) ->
+    {check_and_forward(JID, To, Msg, received), C2SState};
+user_receive_packet(Acc) ->
+    Acc.
+
+-spec c2s_copy_session(c2s_state(), c2s_state()) -> c2s_state().
+c2s_copy_session(State, #{user := U, server := S, resource := R}) ->
+    case ejabberd_sm:get_user_info(U, S, R) of
+	offline -> State;
+	Info ->
+	    case lists:keyfind(carboncopy, 1, Info) of
+		{_, CC} -> State#{carboncopy => CC};
+		false -> State
+	    end
     end.
+
+-spec c2s_session_resumed(c2s_state()) -> c2s_state().
+c2s_session_resumed(#{user := U, server := S, resource := R,
+		      carboncopy := CC} = State) ->
+    ejabberd_sm:set_user_info(U, S, R, carboncopy, CC),
+    maps:remove(carboncopy, State);
+c2s_session_resumed(State) ->
+    State.
+
+-spec c2s_session_opened(c2s_state()) -> c2s_state().
+c2s_session_opened(State) ->
+    maps:remove(carboncopy, State).
 
 % Modified from original version:
 %    - registered to the user_send_packet hook, to be called only once even for multicast
 %    - do not support "private" message mode, and do not modify the original packet in any way
 %    - we also replicate "read" notifications
--spec check_and_forward(jid(), jid(), stanza(), direction()) ->
-			       stanza() | {stop, stanza()}.
-check_and_forward(JID, To, Packet, Direction)->
-    case is_chat_message(Packet) andalso
-	not is_received_muc_pm(To, Packet, Direction) andalso
-	not xmpp:has_subtag(Packet, #carbons_private{}) andalso
-	not xmpp:has_subtag(Packet, #hint{type = 'no-copy'}) of
+-spec check_and_forward(jid(), jid(), message(), direction()) -> message().
+check_and_forward(JID, To, Msg, Direction)->
+    case (is_chat_message(Msg) orelse
+	  is_received_muc_invite(Msg, Direction)) andalso
+	not is_received_muc_pm(To, Msg, Direction) andalso
+	not xmpp:has_subtag(Msg, #carbons_private{}) andalso
+	not xmpp:has_subtag(Msg, #hint{type = 'no-copy'}) of
 	true ->
-	    case is_carbon_copy(Packet) of
-		false ->
-		    send_copies(JID, To, Packet, Direction),
-		    Packet;
-		true ->
-		    %% stop the hook chain, we don't want logging modules to duplicates
-		    %% this message
-		    {stop, Packet}
-	    end;
-        _ ->
-	    Packet
-    end.
-
--spec remove_connection(binary(), binary(), binary(), binary()) -> ok.
-remove_connection(User, Server, Resource, _Status)->
-    disable(Server, User, Resource),
-    ok.
-
+	    send_copies(JID, To, Msg, Direction);
+	false ->
+	    ok
+    end,
+    Msg.
 
 %%% Internal
 %% Direction = received | sent <received xmlns='urn:xmpp:carbons:1'/>
 -spec send_copies(jid(), jid(), message(), direction()) -> ok.
-send_copies(JID, To, Packet, Direction)->
+send_copies(JID, To, Msg, Direction)->
     {U, S, R} = jid:tolower(JID),
     PrioRes = ejabberd_sm:get_user_present_resources(U, S),
     {_, AvailRs} = lists:unzip(PrioRes),
@@ -206,7 +187,7 @@ send_copies(JID, To, Packet, Direction)->
     end,
     %% list of JIDs that should receive a carbon copy of this message (excluding the
     %% receiver(s) of the original message
-    TargetJIDs = case {IsBareTo, Packet} of
+    TargetJIDs = case {IsBareTo, Msg} of
 	{true, #message{meta = #{sm_copy := true}}} ->
 	    %% The message was sent to our bare JID, and we currently have
 	    %% multiple resources with the same highest priority, so the session
@@ -226,19 +207,18 @@ send_copies(JID, To, Packet, Direction)->
 	    %TargetJIDs = lists:delete(JID, [ jid:make({U, S, CCRes}) || CCRes <- list(U, S) ]),
     end,
 
-    lists:map(fun({Dest, _Version}) ->
-		    {_, _, Resource} = jid:tolower(Dest),
-		    ?DEBUG("Sending:  ~p =/= ~p", [R, Resource]),
-		    Sender = jid:make({U, S, <<>>}),
-		    %{xmlelement, N, A, C} = Packet,
-		    New = build_forward_packet(JID, Packet, Sender, Dest, Direction),
-		    ejabberd_router:route(xmpp:set_from_to(New, Sender, Dest))
-	      end, TargetJIDs),
-    ok.
+    lists:foreach(
+      fun({Dest, _Version}) ->
+	      {_, _, Resource} = jid:tolower(Dest),
+	      ?DEBUG("Sending:  ~p =/= ~p", [R, Resource]),
+	      Sender = jid:make({U, S, <<>>}),
+	      New = build_forward_packet(Msg, Sender, Dest, Direction),
+	      ejabberd_router:route(xmpp:set_from_to(New, Sender, Dest))
+      end, TargetJIDs).
 
--spec build_forward_packet(jid(), message(), jid(), jid(), direction()) -> message().
-build_forward_packet(JID, #message{type = T} = Msg, Sender, Dest, Direction) ->
-    Forwarded = #forwarded{sub_els = [complete_packet(JID, Msg, Direction)]},
+-spec build_forward_packet(message(), jid(), jid(), direction()) -> message().
+build_forward_packet(#message{type = T} = Msg, Sender, Dest, Direction) ->
+    Forwarded = #forwarded{sub_els = [Msg]},
     Carbon = case Direction of
 		 sent -> #carbons_sent{forwarded = Forwarded};
 		 received -> #carbons_received{forwarded = Forwarded}
@@ -248,142 +228,80 @@ build_forward_packet(JID, #message{type = T} = Msg, Sender, Dest, Direction) ->
 
 -spec enable(binary(), binary(), binary(), binary()) -> ok | {error, any()}.
 enable(Host, U, R, CC)->
-    ?DEBUG("enabling for ~p", [U]),
-    Mod = gen_mod:ram_db_mod(Host, ?MODULE),
-    case Mod:enable(U, Host, R, CC) of
-	ok ->
-	    delete_cache(Mod, U, Host);
-	{error, _} = Err ->
+    ?DEBUG("Enabling carbons for ~ts@~ts/~ts", [U, Host, R]),
+    case ejabberd_sm:set_user_info(U, Host, R, carboncopy, CC) of
+	ok -> ok;
+	{error, Reason} = Err ->
+	    ?ERROR_MSG("Failed to enable carbons for ~ts@~ts/~ts: ~p",
+		       [U, Host, R, Reason]),
 	    Err
     end.
 
 -spec disable(binary(), binary(), binary()) -> ok | {error, any()}.
 disable(Host, U, R)->
-    ?DEBUG("disabling for ~p", [U]),
-    Mod = gen_mod:ram_db_mod(Host, ?MODULE),
-    Res = Mod:disable(U, Host, R),
-    delete_cache(Mod, U, Host),
-    Res.
+    ?DEBUG("Disabling carbons for ~ts@~ts/~ts", [U, Host, R]),
+    case ejabberd_sm:del_user_info(U, Host, R, carboncopy) of
+	ok -> ok;
+	{error, notfound} -> ok;
+	{error, Reason} = Err ->
+	    ?ERROR_MSG("Failed to disable carbons for ~ts@~ts/~ts: ~p",
+		       [U, Host, R, Reason]),
+	    Err
+    end.
 
--spec complete_packet(jid(), message(), direction()) -> message().
-complete_packet(From, #message{from = undefined} = Msg, sent) ->
-    %% if this is a packet sent by user on this host, then Packet doesn't
-    %% include the 'from' attribute. We must add it.
-    Msg#message{from = From};
-complete_packet(_From, Msg, _Direction) ->
-    Msg.
-
--spec is_chat_message(stanza()) -> boolean().
+-spec is_chat_message(message()) -> boolean().
 is_chat_message(#message{type = chat}) ->
     true;
 is_chat_message(#message{type = normal, body = [_|_]}) ->
     true;
+is_chat_message(#message{type = Type} = Msg) when Type == chat;
+						  Type == normal ->
+    has_chatstate(Msg) orelse xmpp:has_subtag(Msg, #receipt_response{});
 is_chat_message(_) ->
     false.
 
+-spec is_received_muc_invite(message(), direction()) -> boolean().
+is_received_muc_invite(_Msg, sent) ->
+    false;
+is_received_muc_invite(Msg, received) ->
+    case xmpp:get_subtag(Msg, #muc_user{}) of
+	#muc_user{invites = [_|_]} ->
+	    true;
+	_ ->
+	    xmpp:has_subtag(Msg, #x_conference{jid = jid:make(<<"">>)})
+    end.
+
 -spec is_received_muc_pm(jid(), message(), direction()) -> boolean().
-is_received_muc_pm(#jid{lresource = <<>>}, _Packet, _Direction) ->
+is_received_muc_pm(#jid{lresource = <<>>}, _Msg, _Direction) ->
     false;
-is_received_muc_pm(_To, _Packet, sent) ->
+is_received_muc_pm(_To, _Msg, sent) ->
     false;
-is_received_muc_pm(_To, Packet, received) ->
-    xmpp:has_subtag(Packet, #muc_user{}).
+is_received_muc_pm(_To, Msg, received) ->
+    xmpp:has_subtag(Msg, #muc_user{}).
+
+-spec has_chatstate(message()) -> boolean().
+has_chatstate(#message{sub_els = Els}) ->
+    lists:any(fun(El) -> xmpp:get_ns(El) == ?NS_CHATSTATES end, Els).
 
 -spec list(binary(), binary()) -> [{Resource :: binary(), Namespace :: binary()}].
 list(User, Server) ->
-    Mod = gen_mod:ram_db_mod(Server, ?MODULE),
-    case use_cache(Mod, Server) of
-	true ->
-	    case ets_cache:lookup(
-		   ?CARBONCOPY_CACHE, {User, Server},
-		   fun() ->
-			   case Mod:list(User, Server) of
-			       {ok, L} when L /= [] -> {ok, L};
-			       _ -> error
-			   end
-		   end) of
-		{ok, L} -> [{Resource, NS} || {Resource, NS, _} <- L];
-		error -> []
-	    end;
-	false ->
-	    case Mod:list(User, Server) of
-		{ok, L} -> [{Resource, NS} || {Resource, NS, _} <- L];
-		error -> []
-	    end
-    end.
-
--spec init_cache(module(), binary(), gen_mod:opts()) -> ok.
-init_cache(Mod, Host, Opts) ->
-    case use_cache(Mod, Host) of
-	true ->
-	    ets_cache:new(?CARBONCOPY_CACHE, cache_opts(Opts));
-	false ->
-	    ets_cache:delete(?CARBONCOPY_CACHE)
-    end.
-
--spec cache_opts(gen_mod:opts()) -> [proplists:property()].
-cache_opts(Opts) ->
-    MaxSize = gen_mod:get_opt(cache_size, Opts),
-    CacheMissed = gen_mod:get_opt(cache_missed, Opts),
-    LifeTime = case gen_mod:get_opt(cache_life_time, Opts) of
-		   infinity -> infinity;
-		   I -> timer:seconds(I)
-	       end,
-    [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
-
--spec use_cache(module(), binary()) -> boolean().
-use_cache(Mod, Host) ->
-    case erlang:function_exported(Mod, use_cache, 1) of
-	true -> Mod:use_cache(Host);
-	false -> gen_mod:get_module_opt(Host, ?MODULE, use_cache)
-    end.
-
--spec cache_nodes(module(), binary()) -> [node()].
-cache_nodes(Mod, Host) ->
-    case erlang:function_exported(Mod, cache_nodes, 1) of
-	true -> Mod:cache_nodes(Host);
-	false -> ejabberd_cluster:get_nodes()
-    end.
-
--spec clean_cache(node()) -> non_neg_integer().
-clean_cache(Node) ->
-    ets_cache:filter(
-      ?CARBONCOPY_CACHE,
-      fun(_, error) ->
-	      false;
-	 (_, {ok, L}) ->
-	      not lists:any(fun({_, _, N}) -> N == Node end, L)
-      end).
-
--spec clean_cache() -> ok.
-clean_cache() ->
-    ejabberd_cluster:eval_everywhere(?MODULE, clean_cache, [node()]).
-
--spec delete_cache(module(), binary(), binary()) -> ok.
-delete_cache(Mod, User, Server) ->
-    case use_cache(Mod, Server) of
-	true ->
-	    ets_cache:delete(?CARBONCOPY_CACHE, {User, Server},
-			     cache_nodes(Mod, Server));
-	false ->
-	    ok
-    end.
+    lists:filtermap(
+      fun({Resource, Info}) ->
+	      case lists:keyfind(carboncopy, 1, Info) of
+		  {_, NS} -> {true, {Resource, NS}};
+		  false -> false
+	      end
+      end, ejabberd_sm:get_user_info(User, Server)).
 
 depends(_Host, _Opts) ->
     [].
 
-mod_opt_type(ram_db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun(B) when is_boolean(B) -> B end;
-mod_opt_type(O) when O == cache_size; O == cache_life_time ->
-    fun(I) when is_integer(I), I>0 -> I;
-       (unlimited) -> infinity;
-       (infinity) -> infinity
-    end.
+mod_options(_) ->
+    [].
 
-mod_options(Host) ->
-    [{ram_db_type, ejabberd_config:default_ram_db(Host, ?MODULE)},
-     {use_cache, ejabberd_config:use_cache(Host)},
-     {cache_size, ejabberd_config:cache_size(Host)},
-     {cache_missed, ejabberd_config:cache_missed(Host)},
-     {cache_life_time, ejabberd_config:cache_life_time(Host)}].
+mod_doc() ->
+    #{desc =>
+          ?T("The module implements https://xmpp.org/extensions/xep-0280.html"
+             "[XEP-0280: Message Carbons]. "
+             "The module broadcasts messages on all connected "
+             "user resources (devices).")}.

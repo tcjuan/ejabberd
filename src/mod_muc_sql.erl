@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,6 @@
 
 -module(mod_muc_sql).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 -behaviour(mod_muc).
 -behaviour(mod_muc_room).
@@ -50,7 +49,7 @@
 %%% API
 %%%===================================================================
 init(Host, Opts) ->
-    case gen_mod:ram_db_mod(Host, Opts, mod_muc) of
+    case gen_mod:ram_db_mod(Opts, mod_muc) of
 	?MODULE ->
 	    clean_tables(Host);
 	_ ->
@@ -98,7 +97,7 @@ change_room(Host, Room, {del_subscription, JID}) ->
     ejabberd_sql:sql_query_t(?SQL("delete from muc_room_subscribers where "
 				  "room=%(Room)s and host=%(Host)s and jid=%(SJID)s"));
 change_room(Host, Room, Change) ->
-    ?ERROR_MSG("Unsupported change on room ~s@~s: ~p", [Room, Host, Change]).
+    ?ERROR_MSG("Unsupported change on room ~ts@~ts: ~p", [Room, Host, Change]).
 
 restore_room(LServer, Host, Name) ->
     case catch ejabberd_sql:sql_query(
@@ -409,14 +408,15 @@ import(_, _, _) ->
 
 get_subscribed_rooms(LServer, Host, Jid) ->
     JidS = jid:encode(Jid),
-    case catch ejabberd_sql:sql_query(
-	LServer,
-	?SQL("select @(room)s, @(nodes)s from muc_room_subscribers where jid=%(JidS)s"
-	     " and host=%(Host)s")) of
+    case ejabberd_sql:sql_query(
+	   LServer,
+	   ?SQL("select @(room)s, @(nodes)s from muc_room_subscribers "
+		"where jid=%(JidS)s and host=%(Host)s")) of
 	{selected, Subs} ->
-	    [{jid:make(Room, Host, <<>>), ejabberd_sql:decode_term(Nodes)} || {Room, Nodes} <- Subs];
+	    {ok, [{jid:make(Room, Host), ejabberd_sql:decode_term(Nodes)}
+		  || {Room, Nodes} <- Subs]};
 	_Error ->
-	    []
+	    {error, db_failure}
     end.
 
 %%%===================================================================
@@ -431,7 +431,7 @@ clean_tables(ServerHost) ->
 	{updated, _} ->
 	    ok;
 	Err1 ->
-	    ?ERROR_MSG("failed to clean 'muc_online_room' table: ~p", [Err1]),
+	    ?ERROR_MSG("Failed to clean 'muc_online_room' table: ~p", [Err1]),
 	    Err1
     end,
     ?DEBUG("Cleaning SQL muc_online_users table...", []),
@@ -441,6 +441,6 @@ clean_tables(ServerHost) ->
 	{updated, _} ->
 	    ok;
 	Err2 ->
-	    ?ERROR_MSG("failed to clean 'muc_online_users' table: ~p", [Err2]),
+	    ?ERROR_MSG("Failed to clean 'muc_online_users' table: ~p", [Err2]),
 	    Err2
     end.

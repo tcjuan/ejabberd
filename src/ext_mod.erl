@@ -5,7 +5,7 @@
 %%% Created : 19 Feb 2015 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2006-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2006-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,17 +25,16 @@
 
 -module(ext_mod).
 
--behaviour(ejabberd_config).
 -behaviour(gen_server).
 -author("Christophe Romain <christophe.romain@process-one.net>").
 
 -export([start_link/0, update/0, check/1,
          available_command/0, available/0, available/1,
          installed_command/0, installed/0, installed/1,
-         install/1, uninstall/1, upgrade/0, upgrade/1,
+         install/1, uninstall/1, upgrade/0, upgrade/1, add_paths/0,
          add_sources/1, add_sources/2, del_sources/1, modules_dir/0,
-         config_dir/0, opt_type/1, get_commands_spec/0]).
-
+         config_dir/0, get_commands_spec/0]).
+-export([modules_configs/0, module_ebin_dir/1]).
 -export([compile_erlang_file/2, compile_elixir_file/2]).
 
 %% gen_server callbacks
@@ -54,21 +53,26 @@ start_link() ->
 
 init([]) ->
     process_flag(trap_exit, true),
-    [code:add_patha(module_ebin_dir(Module))
-     || {Module, _} <- installed()],
+    add_paths(),
     application:start(inets),
     inets:start(httpc, [{profile, ext_mod}]),
     ejabberd_commands:register_commands(get_commands_spec()),
     {ok, #state{}}.
 
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+add_paths() ->
+    [code:add_patha(module_ebin_dir(Module))
+     || {Module, _} <- installed()].
 
-handle_cast(_Msg, State) ->
+handle_call(Request, From, State) ->
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Request]),
     {noreply, State}.
 
-handle_info(_Info, State) ->
+handle_cast(Msg, State) ->
+    ?WARNING_MSG("Unexpected cast: ~p", [Msg]),
+    {noreply, State}.
+
+handle_info(Info, State) ->
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -155,7 +159,7 @@ update() ->
         end, Contrib, modules_spec(sources_dir(), "*/*")),
     Repos = maps:fold(fun(Repo, _Mods, Acc) ->
                 Update = add_sources(Repo),
-                ?INFO_MSG("Update packages from repo ~s: ~p", [Repo, Update]),
+                ?INFO_MSG("Update packages from repo ~ts: ~p", [Repo, Update]),
                 case Update of
                     ok -> Acc;
                     Error -> [{repository, Repo, Error}|Acc]
@@ -164,7 +168,7 @@ update() ->
     Res = lists:foldl(fun({Package, Spec}, Acc) ->
                 Repo = proplists:get_value(url, Spec, ""),
                 Update = add_sources(Package, Repo),
-                ?INFO_MSG("Update package ~s: ~p", [Package, Update]),
+                ?INFO_MSG("Update package ~ts: ~p", [Package, Update]),
                 case Update of
                     ok -> Acc;
                     Error -> [{Package, Repo, Error}|Acc]
@@ -218,7 +222,7 @@ install(Package) when is_binary(Package) ->
             case compile_and_install(Module, Attrs) of
                 ok ->
                     code:add_patha(module_ebin_dir(Module)),
-                    ejabberd_config:reload_file(),
+                    ejabberd_config:reload(),
                     case erlang:function_exported(Module, post_install, 0) of
                         true -> Module:post_install();
                         _ -> ok
@@ -240,12 +244,12 @@ uninstall(Package) when is_binary(Package) ->
                 _ -> ok
             end,
             [catch gen_mod:stop_module(Host, Module)
-             || Host <- ejabberd_config:get_myhosts()],
+             || Host <- ejabberd_option:hosts()],
             code:purge(Module),
             code:delete(Module),
             code:del_path(module_ebin_dir(Module)),
             delete_path(module_lib_dir(Module)),
-            ejabberd_config:reload_file();
+            ejabberd_config:reload();
         false ->
             {error, not_installed}
     end.
@@ -422,6 +426,14 @@ config_dir() ->
     DefaultDir = filename:join(modules_dir(), "conf"),
     getenv("CONTRIB_MODULES_CONF_DIR", DefaultDir).
 
+-spec modules_configs() -> [binary()].
+modules_configs() ->
+    Fs = [{filename:rootname(filename:basename(F)), F}
+	  || F <- filelib:wildcard(config_dir() ++ "/*.{yml,yaml}")
+		 ++ filelib:wildcard(modules_dir() ++ "/*/conf/*.{yml,yaml}")],
+    [unicode:characters_to_binary(proplists:get_value(F, Fs))
+     || F <- proplists:get_keys(Fs)].
+
 module_lib_dir(Package) ->
     filename:join(modules_dir(), Package).
 
@@ -461,7 +473,7 @@ short_spec({Module, Attrs}) when is_atom(Module), is_list(Attrs) ->
     {Module, proplists:get_value(summary, Attrs, "")}.
 
 is_contrib_allowed() ->
-    ejabberd_config:get_option(allow_contrib_modules, true).
+    ejabberd_option:allow_contrib_modules().
 
 %% -- build functions
 
@@ -558,7 +570,7 @@ compile_result(Results) ->
     end.
 
 compile_options() ->
-    [verbose, report_errors, report_warnings]
+    [verbose, report_errors, report_warnings, ?ALL_DEFS]
     ++ [{i, filename:join(app_dir(App), "include")}
         || App <- [fast_xml, xmpp, p1_utils, ejabberd]]
     ++ [{i, filename:join(mod_dir(Mod), "include")}
@@ -594,6 +606,7 @@ compile_erlang_file(Dest, File, ErlOptions) ->
         {error, E, W} -> {error, {compilation_failed, File, E, W}}
     end.
 
+-ifdef(ELIXIR_ENABLED).
 compile_elixir_file(Dest, File) when is_list(Dest) and is_list(File) ->
   compile_elixir_file(list_to_binary(Dest), list_to_binary(File));
 
@@ -603,6 +616,10 @@ compile_elixir_file(Dest, File) ->
   catch
     _ -> {error, {compilation_failed, File}}
   end.
+-else.
+compile_elixir_file(_, File) ->
+    {error, {compilation_failed, File}}.
+-endif.
 
 install(Module, Spec, SrcDir, LibDir) ->
     {ok, CurDir} = file:get_cwd(),
@@ -679,11 +696,3 @@ format({Key, Val}) when is_binary(Val) ->
     {Key, binary_to_list(Val)};
 format({Key, Val}) -> % TODO: improve Yaml parsing
     {Key, Val}.
-
--spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
-opt_type(allow_contrib_modules) ->
-    fun (false) -> false;
-        (no) -> false;
-        (_) -> true
-    end;
-opt_type(_) -> [allow_contrib_modules].

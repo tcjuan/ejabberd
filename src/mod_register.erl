@@ -5,7 +5,7 @@
 %%% Created :  8 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,8 +25,6 @@
 
 -module(mod_register).
 
--behaviour(ejabberd_config).
-
 -author('alexey@process-one.net').
 
 -protocol({xep, 77, '2.4'}).
@@ -34,13 +32,14 @@
 -behaviour(gen_mod).
 
 -export([start/2, stop/1, reload/3, stream_feature_register/2,
-	 c2s_unauthenticated_packet/2, try_register/5,
+	 c2s_unauthenticated_packet/2, try_register/4,
 	 process_iq/1, send_registration_notifications/3,
-	 transform_options/1, transform_module_options/1,
-	 mod_opt_type/1, mod_options/1, opt_type/1, depends/2]).
+	 mod_opt_type/1, mod_options/1, depends/2,
+	 format_error/1, mod_doc/0]).
 
 -include("logger.hrl").
 -include("xmpp.hrl").
+-include("translate.hrl").
 
 start(Host, _Opts) ->
     gen_iq_handler:add_iq_handler(ejabberd_local, Host,
@@ -73,8 +72,14 @@ depends(_Host, _Opts) ->
     [].
 
 -spec stream_feature_register([xmpp_element()], binary()) -> [xmpp_element()].
-stream_feature_register(Acc, _Host) ->
-    [#feature_register{}|Acc].
+stream_feature_register(Acc, Host) ->
+    case {mod_register_opt:access(Host),
+	  mod_register_opt:ip_access(Host),
+	  mod_register_opt:redirect_url(Host)} of
+	{none, _, undefined} -> Acc;
+	{_, none, undefined} -> Acc;
+	{_, _, _} -> [#feature_register{}|Acc]
+    end.
 
 c2s_unauthenticated_packet(#{ip := IP, server := Server} = State,
 			   #iq{type = T, sub_els = [_]} = IQ)
@@ -103,19 +108,25 @@ process_iq(#iq{from = From} = IQ) ->
 
 process_iq(#iq{from = From, to = To} = IQ, Source) ->
     IsCaptchaEnabled =
-	case gen_mod:get_module_opt(To#jid.lserver, ?MODULE, captcha_protected) of
+	case mod_register_opt:captcha_protected(To#jid.lserver) of
 	    true -> true;
 	    false -> false
 	end,
     Server = To#jid.lserver,
-    Access = gen_mod:get_module_opt(Server, ?MODULE, access_remove),
-    AllowRemove = allow == acl:match_rule(Server, Access, From),
-    process_iq(IQ, Source, IsCaptchaEnabled, AllowRemove).
+    Access = mod_register_opt:access_remove(Server),
+    Remove = case acl:match_rule(Server, Access, From) of
+                 deny -> deny;
+                 allow when From#jid.lserver /= Server ->
+                     deny;
+                 allow ->
+                     check_access(From#jid.luser, Server, Source)
+             end,
+    process_iq(IQ, Source, IsCaptchaEnabled, Remove == allow).
 
 process_iq(#iq{type = set, lang = Lang,
 	       sub_els = [#register{remove = true}]} = IQ,
 	   _Source, _IsCaptchaEnabled, _AllowRemove = false) ->
-    Txt = <<"Access denied by service policy">>,
+    Txt = ?T("Access denied by service policy"),
     xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang));
 process_iq(#iq{type = set, lang = Lang, to = To, from = From,
 	       sub_els = [#register{remove = true,
@@ -126,14 +137,26 @@ process_iq(#iq{type = set, lang = Lang, to = To, from = From,
     if is_binary(User) ->
 	    case From of
 		#jid{user = User, lserver = Server} ->
+                    ResIQ = xmpp:make_iq_result(IQ),
+                    ejabberd_router:route(ResIQ),
 		    ejabberd_auth:remove_user(User, Server),
-		    xmpp:make_iq_result(IQ);
+                    ignore;
 		_ ->
 		    if is_binary(Password) ->
-			    ejabberd_auth:remove_user(User, Server, Password),
-			    xmpp:make_iq_result(IQ);
+                            case ejabberd_auth:check_password(
+                                   User, <<"">>, Server, Password) of
+                                true ->
+                                    ResIQ = xmpp:make_iq_result(IQ),
+                                    ejabberd_router:route(ResIQ),
+                                    ejabberd_auth:remove_user(User, Server),
+                                    ignore;
+                                false ->
+                                    Txt = ?T("Incorrect password"),
+                                    xmpp:make_error(
+                                      IQ, xmpp:err_forbidden(Txt, Lang))
+                            end;
 		       true ->
-			    Txt = <<"No 'password' found in this query">>,
+			    Txt = ?T("No 'password' found in this query"),
 			    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang))
 		    end
 	    end;
@@ -145,7 +168,7 @@ process_iq(#iq{type = set, lang = Lang, to = To, from = From,
 		    ejabberd_auth:remove_user(LUser, Server),
 		    ignore;
 		_ ->
-		    Txt = <<"The query is only allowed from local users">>,
+		    Txt = ?T("The query is only allowed from local users"),
 		    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang))
 	    end
     end;
@@ -168,14 +191,14 @@ process_iq(#iq{type = set, to = To,
 		    try_register_or_set_password(
 		      User, Server, Password, IQ, Source, true);
 		_ ->
-		    Txt = <<"Incorrect data form">>,
+		    Txt = ?T("Incorrect data form"),
 		    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang))
 	    end;
 	{error, malformed} ->
-	    Txt = <<"Incorrect CAPTCHA submit">>,
+	    Txt = ?T("Incorrect CAPTCHA submit"),
 	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
 	_ ->
-	    ErrText = <<"The CAPTCHA verification has failed">>,
+	    ErrText = ?T("The CAPTCHA verification has failed"),
 	    xmpp:make_error(IQ, xmpp:err_not_allowed(ErrText, Lang))
     end;
 process_iq(#iq{type = set} = IQ, _Source, _IsCaptchaEnabled, _AllowRemove) ->
@@ -196,25 +219,25 @@ process_iq(#iq{type = get, from = From, to = To, id = ID, lang = Lang} = IQ,
 		{false, <<"">>}
 	end,
     Instr = translate:translate(
-	      Lang, <<"Choose a username and password to register "
-		      "with this server">>),
-    URL = gen_mod:get_module_opt(Server, ?MODULE, redirect_url),
-    if (URL /= <<"">>) and not IsRegistered ->
-	    Txt = translate:translate(Lang, <<"To register, visit ~s">>),
+	      Lang, ?T("Choose a username and password to register "
+		       "with this server")),
+    URL = mod_register_opt:redirect_url(Server),
+    if (URL /= undefined) and not IsRegistered ->
+	    Txt = translate:translate(Lang, ?T("To register, visit ~s")),
 	    Desc = str:format(Txt, [URL]),
 	    xmpp:make_iq_result(
 	      IQ, #register{instructions = Desc,
 			    sub_els = [#oob_x{url = URL}]});
        IsCaptchaEnabled and not IsRegistered ->
 	    TopInstr = translate:translate(
-			 Lang, <<"You need a client that supports x:data "
-				 "and CAPTCHA to register">>),
+			 Lang, ?T("You need a client that supports x:data "
+				  "and CAPTCHA to register")),
 	    UField = #xdata_field{type = 'text-single',
-				  label = translate:translate(Lang, <<"User">>),
+				  label = translate:translate(Lang, ?T("User")),
 				  var = <<"username">>,
 				  required = true},
 	    PField = #xdata_field{type = 'text-private',
-				  label = translate:translate(Lang, <<"Password">>),
+				  label = translate:translate(Lang, ?T("Password")),
 				  var = <<"password">>,
 				  required = true},
 	    X = #xdata{type = form, instructions = [Instr],
@@ -225,11 +248,11 @@ process_iq(#iq{type = get, from = From, to = To, id = ID, lang = Lang} = IQ,
 		      IQ, #register{instructions = TopInstr,
 				    sub_els = CaptchaEls});
 		{error, limit} ->
-		    ErrText = <<"Too many CAPTCHA requests">>,
+		    ErrText = ?T("Too many CAPTCHA requests"),
 		    xmpp:make_error(
 		      IQ, xmpp:err_resource_constraint(ErrText, Lang));
 		_Err ->
-		    ErrText = <<"Unable to generate a CAPTCHA">>,
+		    ErrText = ?T("Unable to generate a CAPTCHA"),
 		    xmpp:make_error(
 		      IQ, xmpp:err_internal_server_error(ErrText, Lang))
 	    end;
@@ -258,133 +281,141 @@ try_register_or_set_password(User, Server, Password,
 			    xmpp:make_error(IQ, Error)
 		    end;
 		deny ->
-		    Txt = <<"Access denied by service policy">>,
+		    Txt = ?T("Access denied by service policy"),
 		    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang))
 	    end;
 	_ ->
 	    xmpp:make_error(IQ, xmpp:err_not_allowed())
     end.
 
-%% @doc Try to change password and return IQ response
-try_set_password(User, Server, Password, #iq{lang = Lang, meta = M} = IQ) ->
+try_set_password(User, Server, Password) ->
     case is_strong_password(Server, Password) of
-      true ->
-	  case ejabberd_auth:set_password(User, Server, Password) of
-	    ok ->
-		?INFO_MSG("~s has changed password from ~s",
-			  [jid:encode({User, Server, <<"">>}),
-			   ejabberd_config:may_hide_data(
-			     misc:ip_to_list(maps:get(ip, M, {0,0,0,0})))]),
-		xmpp:make_iq_result(IQ);
-	    {error, empty_password} ->
-		Txt = <<"Empty password">>,
-		xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
-	    {error, not_allowed} ->
-		Txt = <<"Changing password is not allowed">>,
-		xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
-	    {error, invalid_jid} ->
-		xmpp:make_error(IQ, xmpp:err_jid_malformed());
-	    {error, invalid_password} ->
-		Txt = <<"Incorrect password">>,
-		xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
-	    Err ->
-		?ERROR_MSG("failed to register user ~s@~s: ~p",
-			   [User, Server, Err]),
-		xmpp:make_error(IQ, xmpp:err_internal_server_error())
-	  end;
-      error_preparing_password ->
-	  ErrText = <<"The password contains unacceptable characters">>,
-	  xmpp:make_error(IQ, xmpp:err_not_acceptable(ErrText, Lang));
-      false ->
-	  ErrText = <<"The password is too weak">>,
-	  xmpp:make_error(IQ, xmpp:err_not_acceptable(ErrText, Lang))
+	true ->
+	    ejabberd_auth:set_password(User, Server, Password);
+	error_preparing_password ->
+	    {error, invalid_password};
+	false ->
+	    {error, weak_password}
+    end.
+
+try_set_password(User, Server, Password, #iq{lang = Lang, meta = M} = IQ) ->
+    case try_set_password(User, Server, Password) of
+	ok ->
+	    ?INFO_MSG("~ts has changed password from ~ts",
+		      [jid:encode({User, Server, <<"">>}),
+		       ejabberd_config:may_hide_data(
+			 misc:ip_to_list(maps:get(ip, M, {0,0,0,0})))]),
+	    xmpp:make_iq_result(IQ);
+	{error, not_allowed} ->
+	    Txt = ?T("Changing password is not allowed"),
+	    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
+	{error, invalid_jid = Why} ->
+	    xmpp:make_error(IQ, xmpp:err_jid_malformed(format_error(Why), Lang));
+	{error, invalid_password = Why} ->
+	    xmpp:make_error(IQ, xmpp:err_not_allowed(format_error(Why), Lang));
+	{error, weak_password = Why} ->
+	    xmpp:make_error(IQ, xmpp:err_not_acceptable(format_error(Why), Lang));
+	{error, db_failure = Why} ->
+	    xmpp:make_error(IQ, xmpp:err_internal_server_error(format_error(Why), Lang))
+    end.
+
+try_register(User, Server, Password, SourceRaw) ->
+    case jid:is_nodename(User) of
+	false ->
+	    {error, invalid_jid};
+	true ->
+	    case check_access(User, Server, SourceRaw) of
+		deny ->
+		    {error, eaccess};
+		allow ->
+		    Source = may_remove_resource(SourceRaw),
+		    case check_timeout(Source) of
+			true ->
+			    case is_strong_password(Server, Password) of
+				true ->
+				    case ejabberd_auth:try_register(
+					   User, Server, Password) of
+					ok ->
+					    ok;
+					{error, _} = Err ->
+					    remove_timeout(Source),
+					    Err
+				    end;
+				false ->
+				    remove_timeout(Source),
+				    {error, weak_password};
+				error_preparing_password ->
+				    remove_timeout(Source),
+				    {error, invalid_password}
+			    end;
+			false ->
+			    {error, wait}
+		    end
+	    end
     end.
 
 try_register(User, Server, Password, SourceRaw, Lang) ->
-    case jid:is_nodename(User) of
-      false -> {error, xmpp:err_bad_request(<<"Malformed username">>, Lang)};
-      _ ->
-	  JID = jid:make(User, Server),
-	  Access = gen_mod:get_module_opt(Server, ?MODULE, access),
-	  IPAccess = get_ip_access(Server),
-	  case {acl:match_rule(Server, Access, JID),
-		check_ip_access(SourceRaw, IPAccess)}
-	      of
-	    {deny, _} -> {error, xmpp:err_forbidden(<<"Access denied by service policy">>, Lang)};
-	    {_, deny} -> {error, xmpp:err_forbidden(<<"Access denied by service policy">>, Lang)};
-	    {allow, allow} ->
-		Source = may_remove_resource(SourceRaw),
-		case check_timeout(Source) of
-		  true ->
-		      case is_strong_password(Server, Password) of
-			true ->
-			    case ejabberd_auth:try_register(User, Server,
-							    Password)
-				of
-			      ok ->
-				  ?INFO_MSG("The account ~s was registered "
-					    "from IP address ~s",
-					    [jid:encode({User, Server, <<"">>}),
-					     ejabberd_config:may_hide_data(
-					       ip_to_string(Source))]),
-				  send_welcome_message(JID),
-				  send_registration_notifications(
-                                    ?MODULE, JID, Source),
-				  ok;
-			      Error ->
-				  remove_timeout(Source),
-				  case Error of
-				    {error, exists} ->
-					Txt = <<"User already exists">>,
-					{error, xmpp:err_conflict(Txt, Lang)};
-				    {error, invalid_jid} ->
-					{error, xmpp:err_jid_malformed()};
-				    {error, invalid_password} ->
-					Txt = <<"Incorrect password">>,
-					{error, xmpp:err_not_allowed(Txt, Lang)};
-				    {error, not_allowed} ->
-					{error, xmpp:err_not_allowed()};
-				    {error, _} ->
-					?ERROR_MSG("failed to register user "
-						   "~s@~s: ~p",
-						   [User, Server, Error]),
-					{error, xmpp:err_internal_server_error()}
-				  end
-			    end;
-			error_preparing_password ->
-			    remove_timeout(Source),
-			    ErrText = <<"The password contains unacceptable characters">>,
-			    {error, xmpp:err_not_acceptable(ErrText, Lang)};
-			false ->
-			    remove_timeout(Source),
-			    ErrText = <<"The password is too weak">>,
-			    {error, xmpp:err_not_acceptable(ErrText, Lang)}
-		      end;
-		  false ->
-		      ErrText =
-			  <<"Users are not allowed to register accounts "
-			    "so quickly">>,
-		      {error, xmpp:err_resource_constraint(ErrText, Lang)}
-		end
-	  end
+    case try_register(User, Server, Password, SourceRaw) of
+	ok ->
+	    JID = jid:make(User, Server),
+	    Source = may_remove_resource(SourceRaw),
+	    ?INFO_MSG("The account ~ts was registered from IP address ~ts",
+		      [jid:encode({User, Server, <<"">>}),
+		       ejabberd_config:may_hide_data(ip_to_string(Source))]),
+	    send_welcome_message(JID),
+	    send_registration_notifications(?MODULE, JID, Source);
+	{error, invalid_jid = Why} ->
+	    {error, xmpp:err_jid_malformed(format_error(Why), Lang)};
+	{error, eaccess = Why} ->
+	    {error, xmpp:err_forbidden(format_error(Why), Lang)};
+	{error, wait = Why} ->
+	    {error, xmpp:err_resource_constraint(format_error(Why), Lang)};
+	{error, weak_password = Why} ->
+	    {error, xmpp:err_not_acceptable(format_error(Why), Lang)};
+	{error, invalid_password = Why} ->
+	    {error, xmpp:err_not_acceptable(format_error(Why), Lang)};
+	{error, not_allowed = Why} ->
+	    {error, xmpp:err_not_allowed(format_error(Why), Lang)};
+	{error, exists = Why} ->
+	    {error, xmpp:err_conflict(format_error(Why), Lang)};
+	{error, db_failure = Why} ->
+	    {error, xmpp:err_internal_server_error(format_error(Why), Lang)}
     end.
+
+format_error(invalid_jid) ->
+    ?T("Malformed username");
+format_error(eaccess) ->
+    ?T("Access denied by service policy");
+format_error(wait) ->
+    ?T("Users are not allowed to register accounts so quickly");
+format_error(weak_password) ->
+    ?T("The password is too weak");
+format_error(invalid_password) ->
+    ?T("The password contains unacceptable characters");
+format_error(not_allowed) ->
+    ?T("Not allowed");
+format_error(exists) ->
+    ?T("User already exists");
+format_error(db_failure) ->
+    ?T("Database failure");
+format_error(Unexpected) ->
+    list_to_binary(io_lib:format(?T("Unexpected error condition: ~p"), [Unexpected])).
 
 send_welcome_message(JID) ->
     Host = JID#jid.lserver,
-    case gen_mod:get_module_opt(Host, ?MODULE, welcome_message) of
+    case mod_register_opt:welcome_message(Host) of
       {<<"">>, <<"">>} -> ok;
       {Subj, Body} ->
 	  ejabberd_router:route(
 	    #message{from = jid:make(Host),
 		     to = JID,
 		     subject = xmpp:mk_text(Subj),
-		     body = xmpp:mk_text(Body)});
-      _ -> ok
+		     body = xmpp:mk_text(Body)})
     end.
 
 send_registration_notifications(Mod, UJID, Source) ->
     Host = UJID#jid.lserver,
-    case gen_mod:get_module_opt(Host, ?MODULE, registration_watchers) of
+    case mod_register_opt:registration_watchers(Host) of
         [] -> ok;
         JIDs when is_list(JIDs) ->
             Body =
@@ -409,14 +440,14 @@ check_from(#jid{user = <<"">>, server = <<"">>},
 	   _Server) ->
     allow;
 check_from(JID, Server) ->
-    Access = gen_mod:get_module_opt(Server, ?MODULE, access_from),
+    Access = mod_register_opt:access_from(Server),
     acl:match_rule(Server, Access, JID).
 
 check_timeout(undefined) -> true;
 check_timeout(Source) ->
-    Timeout = ejabberd_config:get_option(registration_timeout, 600),
+    Timeout = ejabberd_option:registration_timeout(),
     if is_integer(Timeout) ->
-	   Priority = -p1_time_compat:system_time(seconds),
+	   Priority = -erlang:system_time(millisecond),
 	   CleanPriority = Priority + Timeout,
 	   F = fun () ->
 		       Treap = case mnesia:read(mod_register_ip, treap, write)
@@ -439,8 +470,7 @@ check_timeout(Source) ->
 	   case mnesia:transaction(F) of
 	     {atomic, Res} -> Res;
 	     {aborted, Reason} ->
-		 ?ERROR_MSG("mod_register: timeout check error: ~p~n",
-			    [Reason]),
+		 ?ERROR_MSG("timeout check error: ~p~n", [Reason]),
 		 true
 	   end;
        true -> true
@@ -459,7 +489,7 @@ clean_treap(Treap, CleanPriority) ->
 
 remove_timeout(undefined) -> true;
 remove_timeout(Source) ->
-    Timeout = ejabberd_config:get_option(registration_timeout, 600),
+    Timeout = ejabberd_option:registration_timeout(),
     if is_integer(Timeout) ->
 	   F = fun () ->
 		       Treap = case mnesia:read(mod_register_ip, treap, write)
@@ -474,7 +504,7 @@ remove_timeout(Source) ->
 	   case mnesia:transaction(F) of
 	     {atomic, ok} -> ok;
 	     {aborted, Reason} ->
-		 ?ERROR_MSG("mod_register: timeout remove error: "
+		 ?ERROR_MSG("Mod_register: timeout remove error: "
 			    "~p~n",
 			    [Reason]),
 		 ok
@@ -513,60 +543,12 @@ is_strong_password(Server, Password) ->
 
 is_strong_password2(Server, Password) ->
     LServer = jid:nameprep(Server),
-    case gen_mod:get_module_opt(LServer, ?MODULE, password_strength) of
+    case mod_register_opt:password_strength(LServer) of
         0 ->
             true;
         Entropy ->
             ejabberd_auth:entropy(Password) >= Entropy
     end.
-
-transform_options(Opts) ->
-    Opts1 = transform_ip_access(Opts),
-    transform_module_options(Opts1).
-
-transform_ip_access(Opts) ->
-    try
-        {value, {modules, ModOpts}, Opts1} = lists:keytake(modules, 1, Opts),
-        {value, {?MODULE, RegOpts}, ModOpts1} = lists:keytake(?MODULE, 1, ModOpts),
-        {value, {ip_access, L}, RegOpts1} = lists:keytake(ip_access, 1, RegOpts),
-        true = is_list(L),
-        ?WARNING_MSG("Old 'ip_access' format detected. "
-                     "The old format is still supported "
-                     "but it is better to fix your config: "
-                     "use access rules instead.", []),
-        ACLs = lists:flatmap(
-                 fun({Action, S}) ->
-                         ACLName = misc:binary_to_atom(
-                                     iolist_to_binary(
-                                       ["ip_", S])),
-                         [{Action, ACLName},
-                          {acl, ACLName, {ip, S}}]
-                 end, L),
-        Access = {access, mod_register_networks,
-                  [{Action, ACLName} || {Action, ACLName} <- ACLs]},
-        [ACL || {acl, _, _} = ACL <- ACLs] ++
-            [Access,
-             {modules,
-              [{mod_register,
-                [{ip_access, mod_register_networks}|RegOpts1]}
-               | ModOpts1]}|Opts1]
-    catch error:{badmatch, false} ->
-            Opts
-    end.
-
-transform_module_options(Opts) ->
-    lists:flatmap(
-      fun({welcome_message, {Subj, Body}}) ->
-              ?WARNING_MSG("Old 'welcome_message' format detected. "
-                           "The old format is still supported "
-                           "but it is better to fix your config: "
-                           "change it to {welcome_message, "
-                           "[{subject, Subject}, {body, Body}]}",
-                           []),
-              [{welcome_message, [{subject, Subj}, {body, Body}]}];
-         (Opt) ->
-              [Opt]
-      end, Opts).
 
 %%%
 %%% ip_access management
@@ -577,7 +559,7 @@ may_remove_resource({_, _, _} = From) ->
 may_remove_resource(From) -> From.
 
 get_ip_access(Host) ->
-    gen_mod:get_module_opt(Host, ?MODULE, ip_access).
+    mod_register_opt:ip_access(Host).
 
 check_ip_access({User, Server, Resource}, IPAccess) ->
     case ejabberd_sm:get_user_ip(User, Server, Resource) of
@@ -591,32 +573,43 @@ check_ip_access(undefined, _IPAccess) ->
 check_ip_access(IPAddress, IPAccess) ->
     acl:match_rule(global, IPAccess, IPAddress).
 
-mod_opt_type(access) -> fun acl:access_rules_validator/1;
-mod_opt_type(access_from) -> fun acl:access_rules_validator/1;
-mod_opt_type(access_remove) -> fun acl:access_rules_validator/1;
-mod_opt_type(captcha_protected) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(ip_access) -> fun acl:access_rules_validator/1;
-mod_opt_type(password_strength) ->
-    fun (N) when is_number(N), N >= 0 -> N end;
-mod_opt_type(registration_watchers) ->
-    fun (Ss) ->
-	    [jid:decode(iolist_to_binary(S)) || S <- Ss]
-    end;
-mod_opt_type(welcome_message) ->
-    fun(L) ->
-	    {proplists:get_value(subject, L, <<"">>),
-	     proplists:get_value(body, L, <<"">>)}
-    end;
-mod_opt_type({welcome_message, subject}) ->
-    fun iolist_to_binary/1;
-mod_opt_type({welcome_message, body}) ->
-    fun iolist_to_binary/1;
-mod_opt_type(redirect_url) ->
-    fun(<<>>) -> <<>>;
-       (URL) -> misc:try_url(URL)
+check_access(User, Server, Source) ->
+    JID = jid:make(User, Server),
+    Access = mod_register_opt:access(Server),
+    IPAccess = get_ip_access(Server),
+    case acl:match_rule(Server, Access, JID) of
+	allow -> check_ip_access(Source, IPAccess);
+	deny -> deny
     end.
 
+mod_opt_type(access) ->
+    econf:acl();
+mod_opt_type(access_from) ->
+    econf:acl();
+mod_opt_type(access_remove) ->
+    econf:acl();
+mod_opt_type(captcha_protected) ->
+    econf:bool();
+mod_opt_type(ip_access) ->
+    econf:acl();
+mod_opt_type(password_strength) ->
+    econf:number(0);
+mod_opt_type(registration_watchers) ->
+    econf:list(econf:jid());
+mod_opt_type(welcome_message) ->
+    econf:and_then(
+      econf:options(
+	#{subject => econf:binary(),
+	  body => econf:binary()}),
+      fun(Opts) ->
+	      {proplists:get_value(subject, Opts, <<>>),
+	       proplists:get_value(body, Opts, <<>>)}
+      end);
+mod_opt_type(redirect_url) ->
+    econf:url().
+
+-spec mod_options(binary()) -> [{welcome_message, {binary(), binary()}} |
+				{atom(), term()}].
 mod_options(_Host) ->
     [{access, all},
      {access_from, none},
@@ -625,15 +618,70 @@ mod_options(_Host) ->
      {ip_access, all},
      {password_strength, 0},
      {registration_watchers, []},
-     {redirect_url, <<"">>},
-     {welcome_message,
-      [{subject, <<"">>},
-       {body, <<"">>}]}].
+     {redirect_url, undefined},
+     {welcome_message, {<<>>, <<>>}}].
 
--spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
-opt_type(registration_timeout) ->
-    fun (TO) when is_integer(TO), TO > 0 -> TO;
-	(infinity) -> infinity;
-	(unlimited) -> infinity
-    end;
-opt_type(_) -> [registration_timeout].
+mod_doc() ->
+    #{desc =>
+          [?T("This module adds support for https://xmpp.org/extensions/xep-0077.html"
+              "[XEP-0077: In-Band Registration]. "
+              "This protocol enables end users to use a XMPP client to:"), "",
+           ?T("* Register a new account on the server."), "",
+           ?T("* Change the password from an existing account on the server."), "",
+           ?T("* Delete an existing account on the server.")],
+      opts =>
+          [{access,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("Specify rules to restrict what usernames can be registered and "
+                     "unregistered. If a rule returns 'deny' on the requested username, "
+                     "registration and unregistration of that user name is denied. "
+                     "There are no restrictions by default.")}},
+           {access_from,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("By default, 'ejabberd' doesn't allow to register new accounts "
+                     "from s2s or existing c2s sessions. You can change it by defining "
+                     "access rule in this option. Use with care: allowing registration "
+                     "from s2s leads to uncontrolled massive accounts creation by rogue users.")}},
+           {access_remove,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("Specify rules to restrict access for user unregistration. "
+                     "By default any user is able to unregister their account.")}},
+           {captcha_protected,
+            #{value => "true | false",
+              desc =>
+                  ?T("Protect registrations with CAPTCHA (see section "
+                     "https://docs.ejabberd.im/admin/configuration/#captcha[CAPTCHA] "
+                     "of the Configuration Guide). The default is 'false'.")}},
+           {ip_access,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("Define rules to allow or deny account registration depending "
+                     "on the IP address of the XMPP client. The 'AccessName' should "
+                     "be of type 'ip'. The default value is 'all'.")}},
+           {password_strength,
+            #{value => "Entropy",
+              desc =>
+                  ?T("This option sets the minimum "
+                     "https://en.wikipedia.org/wiki/Entropy_(information_theory)"
+                     "[Shannon entropy] for passwords. The value 'Entropy' is a "
+                     "number of bits of entropy. The recommended minimum is 32 bits. "
+                     "The default is 0, i.e. no checks are performed.")}},
+           {registration_watchers,
+            #{value => "[JID, ...]",
+              desc =>
+                  ?T("This option defines a list of JIDs which will be notified each "
+                     "time a new account is registered.")}},
+           {redirect_url,
+            #{value => ?T("URL"),
+              desc =>
+                  ?T("This option enables registration redirection as described in "
+                     "https://xmpp.org/extensions/xep-0077.html#redirect"
+                     "[XEP-0077: In-Band Registration: Redirection].")}},
+           {welcome_message,
+            #{value => "{subject: Subject, body: Body}",
+              desc =>
+                  ?T("Set a welcome message that is sent to each newly registered account. "
+                     "The message will have subject 'Subject' and text 'Body'.")}}]}.

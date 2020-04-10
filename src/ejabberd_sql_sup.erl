@@ -5,7 +5,7 @@
 %%% Created : 22 Dec 2004 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,39 +25,74 @@
 
 -module(ejabberd_sql_sup).
 
--behaviour(ejabberd_config).
-
 -author('alexey@process-one.net').
 
--export([start_link/1, init/1, add_pid/2, remove_pid/2,
-	 get_pids/1, get_random_pid/1, transform_options/1,
-	 reload/1, opt_type/1]).
+-export([start/1, stop/1, stop/0]).
+-export([start_link/0, start_link/1]).
+-export([init/1, reload/1, config_reloaded/0, is_started/1]).
 
 -include("logger.hrl").
--include_lib("stdlib/include/ms_transform.hrl").
 
--define(PGSQL_PORT, 5432).
--define(MYSQL_PORT, 3306).
--define(DEFAULT_POOL_SIZE, 10).
--define(DEFAULT_SQL_START_INTERVAL, 30).
--define(CONNECT_TIMEOUT, 500).
+start(Host) ->
+    case is_started(Host) of
+	true -> ok;
+	false ->
+	    App = case ejabberd_option:sql_type(Host) of
+		      mysql -> p1_mysql;
+		      pgsql -> p1_pgsql;
+		      sqlite -> sqlite3;
+		      _ -> odbc
+		  end,
+	    ejabberd:start_app(App),
+	    Spec = #{id => gen_mod:get_module_proc(Host, ?MODULE),
+		     start => {ejabberd_sql_sup, start_link, [Host]},
+		     restart => transient,
+		     shutdown => infinity,
+		     type => supervisor,
+		     modules => [?MODULE]},
+	    case supervisor:start_child(ejabberd_db_sup, Spec) of
+		{ok, _} -> ok;
+		{error, {already_started, Pid}} ->
+                    %% Wait for the supervisor to fully start
+                    _ = supervisor:count_children(Pid),
+                    ok;
+		{error, Why} = Err ->
+		    ?ERROR_MSG("Failed to start ~ts: ~p", [?MODULE, Why]),
+		    Err
+	    end
+    end.
 
--record(sql_pool, {host :: binary(),
-		   pid  :: pid()}).
+stop(Host) ->
+    Proc = gen_mod:get_module_proc(Host, ?MODULE),
+    case supervisor:terminate_child(ejabberd_db_sup, Proc) of
+	ok -> supervisor:delete_child(ejabberd_db_sup, Proc);
+	Err -> Err
+    end.
+
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 start_link(Host) ->
-    ejabberd_mnesia:create(?MODULE, sql_pool,
-			[{ram_copies, [node()]}, {type, bag},
-			 {local_content, true},
-			 {attributes, record_info(fields, sql_pool)}]),
-    F = fun () -> mnesia:delete({sql_pool, Host}) end,
-    mnesia:ets(F),
     supervisor:start_link({local,
 			   gen_mod:get_module_proc(Host, ?MODULE)},
 			  ?MODULE, [Host]).
 
+stop() ->
+    ejabberd_hooks:delete(host_up, ?MODULE, start, 20),
+    ejabberd_hooks:delete(host_down, ?MODULE, stop, 90),
+    ejabberd_hooks:delete(config_reloaded, ?MODULE, config_reloaded, 20).
+
+init([]) ->
+    file:delete(ejabberd_sql:freetds_config()),
+    file:delete(ejabberd_sql:odbc_config()),
+    file:delete(ejabberd_sql:odbcinst_config()),
+    ejabberd_hooks:add(host_up, ?MODULE, start, 20),
+    ejabberd_hooks:add(host_down, ?MODULE, stop, 90),
+    ejabberd_hooks:add(config_reloaded, ?MODULE, config_reloaded, 20),
+    ignore;
 init([Host]) ->
-    Type = ejabberd_config:get_option({sql_type, Host}, odbc),
+    Type = ejabberd_option:sql_type(Host),
     PoolSize = get_pool_size(Type, Host),
     case Type of
         sqlite ->
@@ -67,103 +102,63 @@ init([Host]) ->
         _ ->
             ok
     end,
-    {ok, {{one_for_one, PoolSize * 10, 1},
-	  [child_spec(I, Host) || I <- lists:seq(1, PoolSize)]}}.
+    {ok, {{one_for_one, PoolSize * 10, 1}, child_specs(Host, PoolSize)}}.
 
+-spec config_reloaded() -> ok.
+config_reloaded() ->
+    lists:foreach(fun reload/1, ejabberd_option:hosts()).
+
+-spec reload(binary()) -> ok.
 reload(Host) ->
-    Type = ejabberd_config:get_option({sql_type, Host}, odbc),
-    NewPoolSize = get_pool_size(Type, Host),
-    OldPoolSize = ets:select_count(
-		    sql_pool,
-		    ets:fun2ms(
-		      fun(#sql_pool{host = H}) when H == Host ->
-			      true
-		      end)),
-    reload(Host, NewPoolSize, OldPoolSize).
-
-reload(Host, NewPoolSize, OldPoolSize) ->
-    Sup = gen_mod:get_module_proc(Host, ?MODULE),
-    if NewPoolSize == OldPoolSize ->
-	    ok;
-       NewPoolSize > OldPoolSize ->
+    case is_started(Host) of
+	true ->
+	    Sup = gen_mod:get_module_proc(Host, ?MODULE),
+	    Type = ejabberd_option:sql_type(Host),
+	    PoolSize = get_pool_size(Type, Host),
 	    lists:foreach(
-	      fun(I) ->
-		      Spec = child_spec(I, Host),
+	      fun(Spec) ->
 		      supervisor:start_child(Sup, Spec)
-	      end, lists:seq(OldPoolSize+1, NewPoolSize));
-       OldPoolSize > NewPoolSize ->
+	      end, child_specs(Host, PoolSize)),
 	    lists:foreach(
-	      fun(I) ->
-		      supervisor:terminate_child(Sup, I),
-		      supervisor:delete_child(Sup, I)
-	      end, lists:seq(NewPoolSize+1, OldPoolSize))
+	      fun({Id, _, _, _}) when Id > PoolSize ->
+		      case supervisor:terminate_child(Sup, Id) of
+			  ok -> supervisor:delete_child(Sup, Id);
+			  _ -> ok
+		      end;
+		 (_) ->
+		      ok
+	      end, supervisor:which_children(Sup));
+	false ->
+	    ok
     end.
 
-get_pids(Host) ->
-    Rs = mnesia:dirty_read(sql_pool, Host),
-    [R#sql_pool.pid || R <- Rs, is_process_alive(R#sql_pool.pid)].
-
-get_random_pid(Host) ->
-    case get_pids(Host) of
-      [] -> none;
-      Pids ->
-	    I = p1_rand:round_robin(length(Pids)) + 1,
-	    lists:nth(I, Pids)
-    end.
-
-add_pid(Host, Pid) ->
-    F = fun () ->
-		mnesia:write(#sql_pool{host = Host, pid = Pid})
-	end,
-    mnesia:ets(F).
-
-remove_pid(Host, Pid) ->
-    F = fun () ->
-		mnesia:delete_object(#sql_pool{host = Host, pid = Pid})
-	end,
-    mnesia:ets(F).
+-spec is_started(binary()) -> boolean().
+is_started(Host) ->
+    whereis(gen_mod:get_module_proc(Host, ?MODULE)) /= undefined.
 
 -spec get_pool_size(atom(), binary()) -> pos_integer().
 get_pool_size(SQLType, Host) ->
-    PoolSize = ejabberd_config:get_option(
-                 {sql_pool_size, Host},
-		 case SQLType of
-		     sqlite -> 1;
-		     _ -> ?DEFAULT_POOL_SIZE
-		 end),
+    PoolSize = ejabberd_option:sql_pool_size(Host),
     if PoolSize > 1 andalso SQLType == sqlite ->
-	    ?WARNING_MSG("it's not recommended to set sql_pool_size > 1 for "
+	    ?WARNING_MSG("It's not recommended to set sql_pool_size > 1 for "
 			 "sqlite, because it may cause race conditions", []);
        true ->
 	    ok
     end,
     PoolSize.
 
-child_spec(I, Host) ->
-    StartInterval = ejabberd_config:get_option(
-                      {sql_start_interval, Host},
-                      ?DEFAULT_SQL_START_INTERVAL),
-    {I, {ejabberd_sql, start_link, [Host, timer:seconds(StartInterval)]},
-     transient, 2000, worker, [?MODULE]}.
+-spec child_spec(binary(), pos_integer()) -> supervisor:child_spec().
+child_spec(Host, I) ->
+    #{id => I,
+      start => {ejabberd_sql, start_link, [Host, I]},
+      restart => transient,
+      shutdown => 2000,
+      type => worker,
+      modules => [?MODULE]}.
 
-transform_options(Opts) ->
-    lists:foldl(fun transform_options/2, [], Opts).
-
-transform_options({odbc_server, {Type, Server, Port, DB, User, Pass}}, Opts) ->
-    [{sql_type, Type},
-     {sql_server, Server},
-     {sql_port, Port},
-     {sql_database, DB},
-     {sql_username, User},
-     {sql_password, Pass}|Opts];
-transform_options({odbc_server, {mysql, Server, DB, User, Pass}}, Opts) ->
-    transform_options({odbc_server, {mysql, Server, ?MYSQL_PORT, DB, User, Pass}}, Opts);
-transform_options({odbc_server, {pgsql, Server, DB, User, Pass}}, Opts) ->
-    transform_options({odbc_server, {pgsql, Server, ?PGSQL_PORT, DB, User, Pass}}, Opts);
-transform_options({odbc_server, {sqlite, DB}}, Opts) ->
-    transform_options({odbc_server, {sqlite, DB}}, Opts);
-transform_options(Opt, Opts) ->
-    [Opt|Opts].
+-spec child_specs(binary(), pos_integer()) -> [supervisor:child_spec()].
+child_specs(Host, PoolSize) ->
+    [child_spec(Host, I) || I <- lists:seq(1, PoolSize)].
 
 check_sqlite_db(Host) ->
     DB = ejabberd_sql:sqlite_db(Host),
@@ -203,7 +198,7 @@ create_sqlite_tables(DB) ->
             [ok = sqlite3:sql_exec(DB, Q) || Q <- Qs],
             ok = sqlite3:sql_exec(DB, "commit");
         {error, Reason} ->
-            ?WARNING_MSG("Failed to read SQLite schema file: ~s",
+            ?WARNING_MSG("Failed to read SQLite schema file: ~ts",
 			 [file:format_error(Reason)])
     end.
 
@@ -234,11 +229,3 @@ read_lines(Fd, File, Acc) ->
             ?ERROR_MSG("Failed read from lite.sql, reason: ~p", [Err]),
             []
     end.
-
--spec opt_type(atom()) -> fun((any()) -> any()) | [atom()].
-opt_type(sql_pool_size) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-opt_type(sql_start_interval) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-opt_type(_) ->
-    [sql_pool_size, sql_start_interval].

@@ -5,7 +5,7 @@
 %%% Created :  7 May 2006 by Mickael Remond <mremond@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -35,6 +35,8 @@
 	 stop_kindly/2, send_service_message_all_mucs/2,
 	 registered_vhosts/0,
 	 reload_config/0,
+	 dump_config/1,
+	 convert_to_yaml/2,
 	 %% Cluster
 	 join_cluster/1, leave_cluster/1, list_cluster/0,
 	 %% Erlang
@@ -50,11 +52,13 @@
 	 set_master/1,
 	 backup_mnesia/1, restore_mnesia/1,
 	 dump_mnesia/1, dump_table/2, load_mnesia/1,
+	 mnesia_info/0, mnesia_table_info/1,
 	 install_fallback_mnesia/1,
 	 dump_to_textfile/1, dump_to_textfile/2,
 	 mnesia_change_nodename/4,
 	 restore/1, % Still used by some modules
 	 clear_cache/0,
+	 gc/0,
 	 get_commands_spec/0
 	]).
 %% gen_server callbacks
@@ -74,14 +78,16 @@ init([]) ->
     ejabberd_commands:register_commands(get_commands_spec()),
     {ok, #state{}}.
 
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(_Msg, State) ->
+handle_call(Request, From, State) ->
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Request]),
     {noreply, State}.
 
-handle_info(_Info, State) ->
+handle_cast(Msg, State) ->
+    ?WARNING_MSG("Unexpected cast: ~p", [Msg]),
+    {noreply, State}.
+
+handle_info(Info, State) ->
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -137,21 +143,17 @@ get_commands_spec() ->
 			desc = "Get the current loglevel",
 			module = ejabberd_logger, function = get,
 			result_desc = "Tuple with the log level number, its keyword and description",
-			result_example = {4, info, <<"Info">>},
+			result_example = warning,
 			args = [],
-                        result = {leveltuple, {tuple, [{levelnumber, integer},
-                                                       {levelatom, atom},
-                                                       {leveldesc, string}
-                                                      ]}}},
+                        result = {levelatom, atom}},
      #ejabberd_commands{name = set_loglevel, tags = [logs, server],
-			desc = "Set the loglevel (0 to 5)",
+			desc = "Set the loglevel",
 			module = ?MODULE, function = set_loglevel,
-			args_desc = ["Integer of the desired logging level, between 1 and 5"],
-			args_example = [5],
-			result_desc = "The type of logger module used",
-			result_example = lager,
-			args = [{loglevel, integer}],
-			result = {logger, atom}},
+			args_desc = ["Desired logging level: none | emergency | alert | critical "
+				     "| error | warning | notice | info | debug"],
+			args_example = [debug],
+			args = [{loglevel, string}],
+			result = {res, rescode}},
 
      #ejabberd_commands{name = update_list, tags = [server],
 			desc = "List modified modules that can be updated",
@@ -198,7 +200,7 @@ get_commands_spec() ->
 			result_example = [<<"example.com">>, <<"anon.example.com">>],
 			args = [],
 			result = {vhosts, {list, {vhost, string}}}},
-     #ejabberd_commands{name = reload_config, tags = [server],
+     #ejabberd_commands{name = reload_config, tags = [server, config],
 			desc = "Reload config file in memory",
 			module = ?MODULE, function = reload_config,
 			args = [],
@@ -267,13 +269,12 @@ get_commands_spec() ->
 			args_example = ["example.com"],
                         args = [{host, string}], result = {res, rescode}},
      #ejabberd_commands{name = convert_to_scram, tags = [sql],
-			desc = "Convert the passwords in 'users' ODBC table to SCRAM",
-			module = ejabberd_auth_sql, function = convert_to_scram,
+			desc = "Convert the passwords of users to SCRAM",
+			module = ejabberd_auth, function = convert_to_scram,
 			args_desc = ["Vhost which users' passwords will be scrammed"],
 			args_example = ["example.com"],
 			args = [{host, binary}], result = {res, rescode}},
-
-     #ejabberd_commands{name = import_prosody, tags = [mnesia, sql, riak],
+     #ejabberd_commands{name = import_prosody, tags = [mnesia, sql],
 			desc = "Import data from Prosody",
 			longdesc = "Note: this method requires ejabberd compiled with optional tools support "
 				"and package must provide optional luerl dependency.",
@@ -284,11 +285,18 @@ get_commands_spec() ->
 
      #ejabberd_commands{name = convert_to_yaml, tags = [config],
                         desc = "Convert the input file from Erlang to YAML format",
-                        module = ejabberd_config, function = convert_to_yaml,
+                        module = ?MODULE, function = convert_to_yaml,
 			args_desc = ["Full path to the original configuration file", "And full path to final file"],
 			args_example = ["/etc/ejabberd/ejabberd.cfg", "/etc/ejabberd/ejabberd.yml"],
                         args = [{in, string}, {out, string}],
                         result = {res, rescode}},
+     #ejabberd_commands{name = dump_config, tags = [config],
+			desc = "Dump configuration in YAML format as seen by ejabberd",
+			module = ?MODULE, function = dump_config,
+			args_desc = ["Full path to output file"],
+			args_example = ["/tmp/ejabberd.yml"],
+			args = [{out, string}],
+			result = {res, rescode}},
 
      #ejabberd_commands{name = delete_expired_messages, tags = [purge],
 			desc = "Delete expired offline messages from database",
@@ -357,6 +365,16 @@ get_commands_spec() ->
 			args_desc = ["Full path to the text file"],
 			args_example = ["/var/lib/ejabberd/database.txt"],
 			args = [{file, string}], result = {res, restuple}},
+     #ejabberd_commands{name = mnesia_info, tags = [mnesia],
+			desc = "Dump info on global Mnesia state",
+			module = ?MODULE, function = mnesia_info,
+			args = [], result = {res, string}},
+     #ejabberd_commands{name = mnesia_table_info, tags = [mnesia],
+			desc = "Dump info on Mnesia table state",
+			module = ?MODULE, function = mnesia_table_info,
+			args_desc = ["Mnesia table name"],
+			args_example = ["roster"],
+			args = [{table, string}], result = {res, string}},
      #ejabberd_commands{name = install_fallback, tags = [mnesia],
 			desc = "Install the database from a fallback file",
 			module = ?MODULE, function = install_fallback_mnesia,
@@ -366,7 +384,15 @@ get_commands_spec() ->
      #ejabberd_commands{name = clear_cache, tags = [server],
 			desc = "Clear database cache on all nodes",
 			module = ?MODULE, function = clear_cache,
-			args = [], result = {res, rescode}}
+			args = [], result = {res, rescode}},
+     #ejabberd_commands{name = gc, tags = [server],
+			desc = "Force full garbage collection",
+			module = ?MODULE, function = gc,
+			args = [], result = {res, rescode}},
+     #ejabberd_commands{name = man, tags = [documentation],
+                        desc = "Generate Unix manpage for current ejabberd version",
+                        module = ejabberd_doc, function = man,
+                        args = [], result = {res, restuple}}
     ].
 
 
@@ -388,17 +414,23 @@ status() ->
     {Is_running, String1 ++ String2}.
 
 reopen_log() ->
-    ejabberd_hooks:run(reopen_log_hook, []),
-    ejabberd_logger:reopen_log().
+    ejabberd_hooks:run(reopen_log_hook, []).
 
 rotate_log() ->
-    ejabberd_hooks:run(rotate_log_hook, []),
-    ejabberd_logger:rotate_log().
+    ejabberd_hooks:run(rotate_log_hook, []).
 
 set_loglevel(LogLevel) ->
-    {module, Module} = ejabberd_logger:set(LogLevel),
-    Module.
-
+    try binary_to_existing_atom(iolist_to_binary(LogLevel), latin1) of
+	Level ->
+	    case lists:member(Level, ejabberd_logger:loglevels()) of
+		true ->
+		    ejabberd_logger:set(Level);
+		false ->
+		    {error, "Invalid log level"}
+	    end
+    catch _:_ ->
+	    {error, "Invalid log level"}
+    end.
 
 %%%
 %%% Stop Kindly
@@ -429,7 +461,7 @@ stop_kindly(DelaySeconds, AnnouncementTextString) ->
 	      SecondsDiff =
 		  calendar:datetime_to_gregorian_seconds({date(), time()})
 		  - TimestampStart,
-	      io:format("[~p/~p ~ps] ~s... ",
+	      io:format("[~p/~p ~ps] ~ts... ",
 			[NumberThis, NumberLast, SecondsDiff, Desc]),
 	      Result = (catch apply(Mod, Func, Args)),
 	      io:format("~p~n", [Result]),
@@ -443,11 +475,13 @@ send_service_message_all_mucs(Subject, AnnouncementText) ->
     Message = str:format("~s~n~s", [Subject, AnnouncementText]),
     lists:foreach(
       fun(ServerHost) ->
-	      MUCHost = gen_mod:get_module_opt_host(
-			  ServerHost, mod_muc, <<"conference.@HOST@">>),
-	      mod_muc:broadcast_service_message(ServerHost, MUCHost, Message)
+	      MUCHosts = gen_mod:get_module_opt_hosts(ServerHost, mod_muc),
+	      lists:foreach(
+		fun(MUCHost) ->
+			mod_muc:broadcast_service_message(ServerHost, MUCHost, Message)
+		end, MUCHosts)
       end,
-      ejabberd_config:get_myhosts()).
+      ejabberd_option:hosts()).
 
 %%%
 %%% ejabberd_update
@@ -478,32 +512,69 @@ update_module(ModuleNameString) ->
 %%%
 
 register(User, Host, Password) ->
-    case ejabberd_auth:try_register(User, Host, Password) of
-	ok ->
-	    {ok, io_lib:format("User ~s@~s successfully registered", [User, Host])};
-	{error, exists} ->
-	    Msg = io_lib:format("User ~s@~s already registered", [User, Host]),
-	    {error, conflict, 10090, Msg};
-	{error, Reason} ->
-	    String = io_lib:format("Can't register user ~s@~s at node ~p: ~p",
-				   [User, Host, node(), Reason]),
-	    {error, cannot_register, 10001, String}
+    case is_my_host(Host) of
+	true ->
+	    case ejabberd_auth:try_register(User, Host, Password) of
+		ok ->
+		    {ok, io_lib:format("User ~s@~s successfully registered", [User, Host])};
+		{error, exists} ->
+		    Msg = io_lib:format("User ~s@~s already registered", [User, Host]),
+		    {error, conflict, 10090, Msg};
+		{error, Reason} ->
+		    String = io_lib:format("Can't register user ~s@~s at node ~p: ~s",
+					   [User, Host, node(),
+					    mod_register:format_error(Reason)]),
+		    {error, cannot_register, 10001, String}
+	    end;
+	false ->
+	    {error, cannot_register, 10001, "Unknown virtual host"}
     end.
 
 unregister(User, Host) ->
-    ejabberd_auth:remove_user(User, Host),
-    {ok, ""}.
+    case is_my_host(Host) of
+	true ->
+	    ejabberd_auth:remove_user(User, Host),
+	    {ok, ""};
+	false ->
+	    {error, "Unknown virtual host"}
+    end.
 
 registered_users(Host) ->
-    Users = ejabberd_auth:get_users(Host),
-    SUsers = lists:sort(Users),
-    lists:map(fun({U, _S}) -> U end, SUsers).
+    case is_my_host(Host) of
+	true ->
+	    Users = ejabberd_auth:get_users(Host),
+	    SUsers = lists:sort(Users),
+	    lists:map(fun({U, _S}) -> U end, SUsers);
+	false ->
+	    {error, "Unknown virtual host"}
+    end.
 
 registered_vhosts() ->
-    ejabberd_config:get_myhosts().
+    ejabberd_option:hosts().
 
 reload_config() ->
-    ejabberd_config:reload_file().
+    case ejabberd_config:reload() of
+	ok -> ok;
+	Err ->
+	    Reason = ejabberd_config:format_error(Err),
+	    {error, Reason}
+    end.
+
+dump_config(Path) ->
+    case ejabberd_config:dump(Path) of
+	ok -> ok;
+	Err ->
+	    Reason = ejabberd_config:format_error(Err),
+	    {error, Reason}
+    end.
+
+convert_to_yaml(In, Out) ->
+    case ejabberd_config:convert_to_yaml(In, Out) of
+	ok -> {ok, ""};
+	Err ->
+	    Reason = ejabberd_config:format_error(Err),
+	    {error, Reason}
+    end.
 
 %%%
 %%% Cluster management
@@ -550,13 +621,13 @@ delete_expired_messages() ->
     lists:foreach(
       fun(Host) ->
               {atomic, ok} = mod_offline:remove_expired_messages(Host)
-      end, ejabberd_config:get_myhosts()).
+      end, ejabberd_option:hosts()).
 
 delete_old_messages(Days) ->
     lists:foreach(
       fun(Host) ->
               {atomic, _} = mod_offline:remove_old_messages(Days, Host)
-      end, ejabberd_config:get_myhosts()).
+      end, ejabberd_option:hosts()).
 
 %%%
 %%% Mnesia management
@@ -590,10 +661,6 @@ restore_mnesia(Path) ->
     case ejabberd_admin:restore(Path) of
 	{atomic, _} ->
 	    {ok, ""};
-	{error, Reason} ->
-	    String = io_lib:format("Can't restore backup from ~p at node ~p: ~p",
-				   [filename:absname(Path), node(), Reason]),
-	    {cannot_restore, String};
 	{aborted,{no_exists,Table}} ->
 	    String = io_lib:format("Can't restore backup from ~p at node ~p: Table ~p does not exist.",
 				   [filename:absname(Path), node(), Table]),
@@ -708,6 +775,13 @@ load_mnesia(Path) ->
 	    {cannot_load, String}
     end.
 
+mnesia_info() ->
+    lists:flatten(io_lib:format("~p", [mnesia:system_info(all)])).
+
+mnesia_table_info(Table) ->
+    ATable = list_to_atom(Table),
+    lists:flatten(io_lib:format("~p", [mnesia:table_info(ATable, all)])).
+
 install_fallback_mnesia(Path) ->
     case mnesia:install_fallback(Path) of
 	ok ->
@@ -767,3 +841,12 @@ mnesia_change_nodename(FromString, ToString, Source, Target) ->
 clear_cache() ->
     Nodes = ejabberd_cluster:get_nodes(),
     lists:foreach(fun(T) -> ets_cache:clear(T, Nodes) end, ets_cache:all()).
+
+gc() ->
+    lists:foreach(fun erlang:garbage_collect/1, processes()).
+
+-spec is_my_host(binary()) -> boolean().
+is_my_host(Host) ->
+    try ejabberd_router:is_my_host(Host)
+    catch _:{invalid_domain, _} -> false
+    end.

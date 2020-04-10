@@ -10,7 +10,7 @@
 
 extract_lang_src2pot ()
 {
-	./tools/extract-tr.sh ebin/ > priv/msgs/ejabberd.pot
+	./tools/extract-tr.sh src > priv/msgs/ejabberd.pot
 }
 
 extract_lang_popot2po ()
@@ -20,7 +20,7 @@ extract_lang_popot2po ()
 	POT_PATH=$MSGS_DIR/$PROJECT.pot
 
 	msgmerge $PO_PATH $POT_PATH >$PO_PATH.translate 2>/dev/null
-	mv $PO_PATH.translate $PO_PATH 
+	mv $PO_PATH.translate $PO_PATH
 }
 
 extract_lang_po2msg ()
@@ -48,7 +48,7 @@ extract_lang_po2msg ()
 	msgattrib $PO_PATH --translated --no-fuzzy --no-obsolete --no-location --no-wrap | grep "^msg" | tail --lines=+3 >$MS_PATH
 	grep "^msgid" $PO_PATH.ms | sed 's/^msgid //g' >$MSGID_PATH
 	grep "^msgstr" $PO_PATH.ms | sed 's/^msgstr //g' >$MSGSTR_PATH
-	echo "%% -*- coding: latin-1 -*-" >$MSGS_PATH
+	echo "%% -*- coding: utf-8 -*-" >$MSGS_PATH
 	paste $MSGID_PATH $MSGSTR_PATH --delimiter=, | awk '{print "{" $0 "}."}' | sort -g >>$MSGS_PATH
 
 	rm $MS_PATH

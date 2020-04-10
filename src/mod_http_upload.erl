@@ -5,7 +5,7 @@
 %%% Created : 20 Aug 2015 by Holger Weiss <holger@zedat.fu-berlin.de>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2015-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2015-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,7 +25,8 @@
 
 -module(mod_http_upload).
 -author('holger@zedat.fu-berlin.de').
-
+-behaviour(gen_server).
+-behaviour(gen_mod).
 -protocol({xep, 363, '0.1'}).
 
 -define(SERVICE_REQUEST_TIMEOUT, 5000). % 5 seconds.
@@ -57,13 +58,12 @@
 	 {<<".xz">>, <<"application/x-xz">>},
 	 {<<".zip">>, <<"application/zip">>}]).
 
--behaviour(gen_server).
--behaviour(gen_mod).
-
 %% gen_mod/supervisor callbacks.
 -export([start/2,
 	 stop/1,
+	 reload/3,
 	 depends/2,
+         mod_doc/0,
 	 mod_opt_type/1,
 	 mod_options/1]).
 
@@ -92,139 +92,123 @@
 -include("translate.hrl").
 
 -record(state,
-	{server_host            :: binary(),
-	 hosts                  :: [binary()],
-	 name                   :: binary(),
-	 access                 :: atom(),
-	 max_size               :: pos_integer() | infinity,
-	 secret_length          :: pos_integer(),
-	 jid_in_url             :: sha1 | node,
+	{server_host = <<>>     :: binary(),
+	 hosts = []             :: [binary()],
+	 name = <<>>            :: binary(),
+	 access = none          :: atom(),
+	 max_size = infinity    :: pos_integer() | infinity,
+	 secret_length = 40     :: pos_integer(),
+	 jid_in_url = sha1      :: sha1 | node,
 	 file_mode              :: integer() | undefined,
 	 dir_mode               :: integer() | undefined,
-	 docroot                :: binary(),
-	 put_url                :: binary(),
-	 get_url                :: binary(),
+	 docroot = <<>>         :: binary(),
+	 put_url = <<>>         :: binary(),
+	 get_url = <<>>         :: binary(),
 	 service_url            :: binary() | undefined,
-	 thumbnail              :: boolean(),
-	 custom_headers         :: [{binary(), binary()}],
-	 slots = #{}            :: map(),
-	 external_secret        :: binary()}).
+	 thumbnail = false      :: boolean(),
+	 custom_headers = []    :: [{binary(), binary()}],
+	 slots = #{}            :: slots(),
+	 external_secret = <<>> :: binary()}).
 
 -record(media_info,
-	{type   :: atom(),
+	{path   :: binary(),
+	 type   :: atom(),
 	 height :: integer(),
 	 width  :: integer()}).
 
 -type state() :: #state{}.
 -type slot() :: [binary(), ...].
+-type slots() :: #{slot() => {pos_integer(), reference()}}.
 -type media_info() :: #media_info{}.
 
 %%--------------------------------------------------------------------
 %% gen_mod/supervisor callbacks.
 %%--------------------------------------------------------------------
--spec start(binary(), gen_mod:opts()) -> {ok, pid()} | {error, already_started}.
+-spec start(binary(), gen_mod:opts()) -> {ok, pid()} | {error, term()}.
 start(ServerHost, Opts) ->
-    case gen_mod:get_opt(rm_on_unregister, Opts) of
-	true ->
-	    ejabberd_hooks:add(remove_user, ServerHost, ?MODULE,
-			       remove_user, 50);
-	false ->
-	    ok
-    end,
     Proc = get_proc_name(ServerHost, ?MODULE),
-    case whereis(Proc) of
-	undefined ->
-	    gen_mod:start_child(?MODULE, ServerHost, Opts, Proc);
-	_Pid ->
+    case gen_mod:start_child(?MODULE, ServerHost, Opts, Proc) of
+	{ok, _} = Ret -> Ret;
+	{error, {already_started, _}} = Err ->
 	    ?ERROR_MSG("Multiple virtual hosts can't use a single 'put_url' "
 		       "without the @HOST@ keyword", []),
-	    {error, already_started}
+	    Err;
+	Err ->
+	    Err
     end.
 
 -spec stop(binary()) -> ok | {error, any()}.
 stop(ServerHost) ->
-    case gen_mod:get_module_opt(ServerHost, ?MODULE, rm_on_unregister) of
-	true ->
-	    ejabberd_hooks:delete(remove_user, ServerHost, ?MODULE,
-				  remove_user, 50);
-	false ->
-	    ok
-    end,
     Proc = get_proc_name(ServerHost, ?MODULE),
     gen_mod:stop_child(Proc).
 
--spec mod_opt_type(atom()) -> fun((term()) -> term()) | [atom()].
-mod_opt_type(host) ->
-    fun ejabberd_config:v_host/1;
-mod_opt_type(hosts) ->
-    fun ejabberd_config:v_hosts/1;
-mod_opt_type(name) ->
-    fun iolist_to_binary/1;
-mod_opt_type(access) ->
-    fun acl:access_rules_validator/1;
-mod_opt_type(max_size) ->
-    fun(I) when is_integer(I), I > 0 -> I;
-       (infinity) -> infinity
-    end;
-mod_opt_type(secret_length) ->
-    fun(I) when is_integer(I), I >= 8 -> I end;
-mod_opt_type(jid_in_url) ->
-    fun(sha1) -> sha1;
-       (node) -> node
-    end;
-mod_opt_type(file_mode) ->
-    fun(undefined) -> undefined;
-       (Mode) -> binary_to_integer(iolist_to_binary(Mode), 8)
-    end;
-mod_opt_type(dir_mode) ->
-    fun(undefined) -> undefined;
-       (Mode) -> binary_to_integer(iolist_to_binary(Mode), 8)
-    end;
-mod_opt_type(docroot) ->
-    fun iolist_to_binary/1;
-mod_opt_type(put_url) ->
-    fun misc:try_url/1;
-mod_opt_type(get_url) ->
-    fun(undefined) -> undefined;
-       (URL) -> misc:try_url(URL)
-    end;
-mod_opt_type(service_url) ->
-    fun(undefined) -> undefined;
-       (URL) ->
-	   ?WARNING_MSG("option 'service_url' is deprecated, consider unsing "
-	                "the 'external_secret' interface instead", []),
-	   misc:try_url(URL)
-    end;
-mod_opt_type(custom_headers) ->
-    fun(Headers) ->
-	    lists:map(fun({K, V}) ->
-			      {iolist_to_binary(K), iolist_to_binary(V)}
-		      end, Headers)
-    end;
-mod_opt_type(rm_on_unregister) ->
-    fun(B) when is_boolean(B) -> B end;
-mod_opt_type(thumbnail) ->
-    fun(true) ->
-	    case eimp:supported_formats() of
-		[] ->
-		    ?WARNING_MSG("ejabberd is built without image converter "
-				 "support, option '~s' is ignored",
-				 [thumbnail]),
-		    erlang:error(badarg);
-		_ ->
-		    true
-	    end;
-       (false) ->
-	    false
-    end;
-mod_opt_type(external_secret) ->
-    fun iolist_to_binary/1.
+-spec reload(binary(), gen_mod:opts(), gen_mod:opts()) -> ok | {ok, pid()} | {error, term()}.
+reload(ServerHost, NewOpts, OldOpts) ->
+    NewURL = mod_http_upload_opt:put_url(NewOpts),
+    OldURL = mod_http_upload_opt:put_url(OldOpts),
+    OldProc = get_proc_name(ServerHost, ?MODULE, OldURL),
+    NewProc = get_proc_name(ServerHost, ?MODULE, NewURL),
+    if OldProc /= NewProc ->
+	    gen_mod:stop_child(OldProc),
+	    start(ServerHost, NewOpts);
+       true ->
+	    gen_server:cast(NewProc, {reload, NewOpts, OldOpts})
+    end.
 
--spec mod_options(binary()) -> [{atom(), any()}].
-mod_options(_Host) ->
-    [{host, <<"upload.@HOST@">>},
+-spec mod_opt_type(atom()) -> econf:validator().
+mod_opt_type(name) ->
+    econf:binary();
+mod_opt_type(access) ->
+    econf:acl();
+mod_opt_type(max_size) ->
+    econf:pos_int(infinity);
+mod_opt_type(secret_length) ->
+    econf:int(8, 1000);
+mod_opt_type(jid_in_url) ->
+    econf:enum([sha1, node]);
+mod_opt_type(file_mode) ->
+    econf:octal();
+mod_opt_type(dir_mode) ->
+    econf:octal();
+mod_opt_type(docroot) ->
+    econf:binary();
+mod_opt_type(put_url) ->
+    econf:url();
+mod_opt_type(get_url) ->
+    econf:url();
+mod_opt_type(service_url) ->
+    econf:url();
+mod_opt_type(custom_headers) ->
+    econf:map(econf:binary(), econf:binary());
+mod_opt_type(rm_on_unregister) ->
+    econf:bool();
+mod_opt_type(thumbnail) ->
+    econf:and_then(
+      econf:bool(),
+      fun(true) ->
+	      case eimp:supported_formats() of
+		  [] -> econf:fail(eimp_error);
+		  [_|_] -> true
+	      end;
+	 (false) ->
+	      false
+      end);
+mod_opt_type(external_secret) ->
+    econf:binary();
+mod_opt_type(host) ->
+    econf:host();
+mod_opt_type(hosts) ->
+    econf:hosts();
+mod_opt_type(vcard) ->
+    econf:vcard_temp().
+
+-spec mod_options(binary()) -> [{thumbnail, boolean()} |
+				{atom(), any()}].
+mod_options(Host) ->
+    [{host, <<"upload.", Host/binary>>},
      {hosts, []},
      {name, ?T("HTTP File Upload")},
+     {vcard, undefined},
      {access, local},
      {max_size, 104857600},
      {secret_length, 40},
@@ -232,13 +216,189 @@ mod_options(_Host) ->
      {file_mode, undefined},
      {dir_mode, undefined},
      {docroot, <<"@HOME@/upload">>},
-     {put_url, <<"https://@HOST@:5443/upload">>},
+     {put_url, <<"https://", Host/binary, ":5443/upload">>},
      {get_url, undefined},
      {service_url, undefined},
      {external_secret, <<"">>},
      {custom_headers, []},
      {rm_on_unregister, true},
      {thumbnail, false}].
+
+mod_doc() ->
+    #{desc =>
+          [?T("This module allows for requesting permissions to "
+              "upload a file via HTTP as described in "
+              "https://xmpp.org/extensions/xep-0363.html"
+              "[XEP-0363: HTTP File Upload]. If the request is accepted, "
+              "the client receives a URL for uploading the file and "
+              "another URL from which that file can later be downloaded."), "",
+           ?T("In order to use this module, it must be configured as "
+              "a 'request_handler' for 'ejabberd_http' listener.")],
+      opts =>
+          [{host,
+            #{desc => ?T("Deprecated. Use 'hosts' instead.")}},
+           {hosts,
+            #{value => ?T("[Host, ...]"),
+              desc =>
+                  ?T("This option defines the Jabber IDs of the service. "
+                     "If the 'hosts' option is not specified, the only Jabber ID will "
+                     "be the hostname of the virtual host with the prefix \"upload.\". "
+                     "The keyword '@HOST@' is replaced with the real virtual host name.")}},
+           {name,
+            #{value => ?T("Name"),
+              desc =>
+                  ?T("A name of the service in the Service Discovery. "
+                     "This will only be displayed by special XMPP clients. "
+                     "The default value is \"HTTP File Upload\".")}},
+           {access,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("This option defines the access rule to limit who is "
+                     "permitted to use the HTTP upload service. "
+                     "The default value is 'local'. If no access rule of "
+                     "that name exists, no user will be allowed to use the service.")}},
+           {max_size,
+            #{value => ?T("Size"),
+              desc =>
+                  ?T("This option limits the acceptable file size. "
+                     "Either a number of bytes (larger than zero) or "
+                     "'infinity' must be specified. "
+                     "The default value is '104857600'.")}},
+           {secret_length,
+            #{value => ?T("Length"),
+              desc =>
+                  ?T("This option defines the length of the random "
+                     "string included in the GET and PUT URLs generated "
+                     "by 'mod_http_upload'. The minimum length is 8 characters, "
+                     "but it is recommended to choose a larger value. "
+                     "The default value is '40'.")}},
+           {jid_in_url,
+            #{value => "node | sha1",
+              desc =>
+                  ?T("When this option is set to 'node', the node identifier "
+                     "of the user's JID (i.e., the user name) is included in "
+                     "the GET and PUT URLs generated by 'mod_http_upload'. "
+                     "Otherwise, a SHA-1 hash of the user's bare JID is "
+                     "included instead. The default value is 'sha1'.")}},
+           {thumbnail,
+            #{value => "true | false",
+              desc =>
+                  ?T("This option specifies whether ejabberd should create "
+                     "thumbnails of uploaded images. If a thumbnail is created, "
+                     "a <thumbnail/> element that contains the download <uri/> "
+                     "and some metadata is returned with the PUT response. "
+                     "The default value is 'false'.")}},
+           {file_mode,
+            #{value => ?T("Permission"),
+              desc =>
+                  ?T("This option defines the permission bits of uploaded files. "
+                     "The bits are specified as an octal number (see the chmod(1) "
+                     "manual page) within double quotes. For example: \"0644\". "
+                     "The default is undefined, which means no explicit permissions "
+                     "will be set.")}},
+           {dir_mode,
+            #{value => ?T("Permission"),
+              desc =>
+                  ?T("This option defines the permission bits of the 'docroot' "
+                     "directory and any directories created during file uploads. "
+                     "The bits are specified as an octal number (see the chmod(1) "
+                     "manual page) within double quotes. For example: \"0755\". "
+                     "The default is undefined, which means no explicit permissions "
+                     "will be set.")}},
+           {docroot,
+            #{value => ?T("Path"),
+              desc =>
+                  ?T("Uploaded files are stored below the directory specified "
+                       "(as an absolute path) with this option. The keyword "
+                     "@HOME@ is replaced with the home directory of the user "
+                     "running ejabberd, and the keyword @HOST@ with the virtual "
+                     "host name. The default value is \"@HOME@/upload\".")}},
+           {put_url,
+            #{value => ?T("URL"),
+              desc =>
+                  ?T("This option specifies the initial part of the PUT URLs "
+                     "used for file uploads. The keyword @HOST@ is replaced "
+                     "with the virtual host name. NOTE: different virtual "
+                     "hosts cannot use the same PUT URL. "
+                     "The default value is \"https://@HOST@:5443\".")}},
+           {get_url,
+            #{value => ?T("URL"),
+              desc =>
+                  ?T("This option specifies the initial part of the GET URLs "
+                     "used for downloading the files. By default, it is set "
+                     "to the same value as 'put_url'. The keyword @HOST@ is "
+                     "replaced with the virtual host name. NOTE: if GET requests "
+                     "are handled by 'mod_http_upload', the 'get_url' must match the "
+                     "'put_url'. Setting it to a different value only makes "
+                     "sense if an external web server or 'mod_http_fileserver' "
+                     "is used to serve the uploaded files.")}},
+           {service_url,
+            #{desc => ?T("Deprecated.")}},
+           {custom_headers,
+            #{value => "{Name: Value}",
+              desc =>
+                  ?T("This option specifies additional header fields to be "
+                     "included in all HTTP responses. By default no custom "
+                     "headers are included.")}},
+           {external_secret,
+            #{value => ?T("Text"),
+              desc =>
+                  ?T("This option makes it possible to offload all HTTP "
+                     "Upload processing to a separate HTTP server. "
+                     "Both ejabberd and the HTTP server should share this "
+                     "secret and behave exactly as described at "
+                     "https://modules.prosody.im/mod_http_upload_external.html"
+                     "[Prosody's mod_http_upload_external] in the "
+                     "'Implementation' section. There is no default value.")}},
+           {rm_on_unregister,
+            #{value => "true | false",
+              desc =>
+                  ?T("This option specifies whether files uploaded by a user "
+                     "should be removed when that user is unregistered. "
+                     "The default value is 'true'.")}},
+           {vcard,
+            #{value => ?T("vCard"),
+              desc =>
+                  ?T("A custom vCard of the service that will be displayed "
+                     "by some XMPP clients in Service Discovery. The value of "
+                     "'vCard' is a YAML map constructed from an XML representation "
+                     "of vCard. Since the representation has no attributes, "
+                     "the mapping is straightforward."),
+              example =>
+                  [{?T("For example, the following XML representation of vCard:"),
+                    ["<vCard xmlns='vcard-temp'>",
+                     "  <FN>Conferences</FN>",
+                     "  <ADR>",
+                     "    <WORK/>",
+                     "    <STREET>Elm Street</STREET>",
+                     "  </ADR>",
+                     "</vCard>"]},
+                   {?T("will be translated to:"),
+                    ["vcard:",
+                     "  fn: Conferences",
+                     "  adr:",
+                     "    -",
+                     "      work: true",
+                     "      street: Elm Street"]}]}}],
+      example =>
+          ["listen:",
+           "  ...",
+           "  -",
+           "    port: 5443",
+           "    module: ejabberd_http",
+           "    tls: true",
+           "    request_handlers:",
+           "      ...",
+           "      /upload: mod_http_upload",
+           "      ...",
+           "  ...",
+           "",
+           "modules:",
+           "  ...",
+           "  mod_http_upload:",
+           "    docroot: /ejabberd/upload",
+           "    put_url: \"https://@HOST@:5443/upload\"",
+           "  ..."]}.
 
 -spec depends(binary(), gen_mod:opts()) -> [{module(), hard | soft}].
 depends(_Host, _Opts) ->
@@ -248,49 +408,19 @@ depends(_Host, _Opts) ->
 %% gen_server callbacks.
 %%--------------------------------------------------------------------
 -spec init(list()) -> {ok, state()}.
-init([ServerHost, Opts]) ->
+init([ServerHost|_]) ->
     process_flag(trap_exit, true),
-    Hosts = gen_mod:get_opt_hosts(ServerHost, Opts),
-    Name = gen_mod:get_opt(name, Opts),
-    Access = gen_mod:get_opt(access, Opts),
-    MaxSize = gen_mod:get_opt(max_size, Opts),
-    SecretLength = gen_mod:get_opt(secret_length, Opts),
-    JIDinURL = gen_mod:get_opt(jid_in_url, Opts),
-    DocRoot = gen_mod:get_opt(docroot, Opts),
-    FileMode = gen_mod:get_opt(file_mode, Opts),
-    DirMode = gen_mod:get_opt(dir_mode, Opts),
-    PutURL = gen_mod:get_opt(put_url, Opts),
-    GetURL = case gen_mod:get_opt(get_url, Opts) of
-		 undefined -> PutURL;
-		 URL -> URL
-	     end,
-    ServiceURL = gen_mod:get_opt(service_url, Opts),
-    Thumbnail = gen_mod:get_opt(thumbnail, Opts),
-    ExternalSecret = gen_mod:get_opt(external_secret, Opts),
-    CustomHeaders = gen_mod:get_opt(custom_headers, Opts),
-    DocRoot1 = expand_home(str:strip(DocRoot, right, $/)),
-    DocRoot2 = expand_host(DocRoot1, ServerHost),
-    case DirMode of
-	undefined ->
-	    ok;
-	Mode ->
-	    file:change_mode(DocRoot2, Mode)
+    Opts = gen_mod:get_module_opts(ServerHost, ?MODULE),
+    Hosts = gen_mod:get_opt_hosts(Opts),
+    case mod_http_upload_opt:rm_on_unregister(Opts) of
+	true ->
+	    ejabberd_hooks:add(remove_user, ServerHost, ?MODULE,
+			       remove_user, 50);
+	false ->
+	    ok
     end,
-    lists:foreach(
-      fun(Host) ->
-	      ejabberd_router:register_route(Host, ServerHost)
-      end, Hosts),
-    {ok, #state{server_host = ServerHost, hosts = Hosts, name = Name,
-		access = Access, max_size = MaxSize,
-		secret_length = SecretLength, jid_in_url = JIDinURL,
-		file_mode = FileMode, dir_mode = DirMode,
-		thumbnail = Thumbnail,
-		docroot = DocRoot2,
-		put_url = expand_host(str:strip(PutURL, right, $/), ServerHost),
-		get_url = expand_host(str:strip(GetURL, right, $/), ServerHost),
-		service_url = ServiceURL,
-		external_secret = ExternalSecret,
-		custom_headers = CustomHeaders}}.
+    State = init_state(ServerHost, Hosts, Opts),
+    {ok, State}.
 
 -spec handle_call(_, {pid(), _}, state())
       -> {reply, {ok, pos_integer(), binary(),
@@ -322,12 +452,30 @@ handle_call(get_conf, _From,
 	           custom_headers = CustomHeaders} = State) ->
     {reply, {ok, DocRoot, CustomHeaders}, State};
 handle_call(Request, From, State) ->
-    ?ERROR_MSG("Got unexpected request from ~p: ~p", [From, Request]),
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Request]),
     {noreply, State}.
 
 -spec handle_cast(_, state()) -> {noreply, state()}.
+handle_cast({reload, NewOpts, OldOpts},
+	    #state{server_host = ServerHost} = State) ->
+    case {mod_http_upload_opt:rm_on_unregister(NewOpts),
+	  mod_http_upload_opt:rm_on_unregister(OldOpts)} of
+	{true, false} ->
+	    ejabberd_hooks:add(remove_user, ServerHost, ?MODULE,
+			       remove_user, 50);
+	{false, true} ->
+	    ejabberd_hooks:delete(remove_user, ServerHost, ?MODULE,
+				  remove_user, 50);
+	_ ->
+	    ok
+    end,
+    NewHosts = gen_mod:get_opt_hosts(NewOpts),
+    OldHosts = gen_mod:get_opt_hosts(OldOpts),
+    lists:foreach(fun ejabberd_router:unregister_route/1, OldHosts -- NewHosts),
+    NewState = init_state(State#state{hosts = NewHosts -- OldHosts}, NewOpts),
+    {noreply, NewState};
 handle_cast(Request, State) ->
-    ?ERROR_MSG("Got unexpected request: ~p", [Request]),
+    ?WARNING_MSG("Unexpected cast: ~p", [Request]),
     {noreply, State}.
 
 -spec handle_info(timeout | _, state()) -> {noreply, state()}.
@@ -358,17 +506,18 @@ handle_info({timeout, _TRef, Slot}, State) ->
     NewState = del_slot(Slot, State),
     {noreply, NewState};
 handle_info(Info, State) ->
-    ?ERROR_MSG("Got unexpected info: ~p", [Info]),
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 -spec terminate(normal | shutdown | {shutdown, _} | _, state()) -> ok.
 terminate(Reason, #state{server_host = ServerHost, hosts = Hosts}) ->
-    ?DEBUG("Stopping HTTP upload process for ~s: ~p", [ServerHost, Reason]),
+    ?DEBUG("Stopping HTTP upload process for ~ts: ~p", [ServerHost, Reason]),
+    ejabberd_hooks:delete(remove_user, ServerHost, ?MODULE, remove_user, 50),
     lists:foreach(fun ejabberd_router:unregister_route/1, Hosts).
 
 -spec code_change({down, _} | _, state(), _) -> {ok, state()}.
 code_change(_OldVsn, #state{server_host = ServerHost} = State, _Extra) ->
-    ?DEBUG("Updating HTTP upload process for ~s", [ServerHost]),
+    ?DEBUG("Updating HTTP upload process for ~ts", [ServerHost]),
     {ok, State}.
 
 %%--------------------------------------------------------------------
@@ -381,41 +530,47 @@ process(LocalPath, #request{method = Method, host = Host, ip = IP})
 	 Method == 'PUT' orelse
 	 Method == 'GET' orelse
 	 Method == 'HEAD' ->
-    ?DEBUG("Rejecting ~s request from ~s for ~s: Too few path components",
+    ?DEBUG("Rejecting ~ts request from ~ts for ~ts: Too few path components",
 	   [Method, encode_addr(IP), Host]),
     http_response(404);
 process(_LocalPath, #request{method = 'PUT', host = Host, ip = IP,
 			     length = Length} = Request) ->
     {Proc, Slot} = parse_http_request(Request),
-    case catch gen_server:call(Proc, {use_slot, Slot, Length}, ?CALL_TIMEOUT) of
+    try gen_server:call(Proc, {use_slot, Slot, Length}, ?CALL_TIMEOUT) of
 	{ok, Path, FileMode, DirMode, GetPrefix, Thumbnail, CustomHeaders} ->
-	    ?DEBUG("Storing file from ~s for ~s: ~s",
+	    ?DEBUG("Storing file from ~ts for ~ts: ~ts",
 		   [encode_addr(IP), Host, Path]),
 	    case store_file(Path, Request, FileMode, DirMode,
 			    GetPrefix, Slot, Thumbnail) of
 		ok ->
 		    http_response(201, CustomHeaders);
 		{ok, Headers, OutData} ->
-		    http_response(201, Headers ++ CustomHeaders, OutData);
+		    http_response(201, ejabberd_http:apply_custom_headers(Headers, CustomHeaders), OutData);
 		{error, closed} ->
-		    ?DEBUG("Cannot store file ~s from ~s for ~s: connection closed",
+		    ?DEBUG("Cannot store file ~ts from ~ts for ~ts: connection closed",
 			   [Path, encode_addr(IP), Host]),
 		    http_response(404);
 		{error, Error} ->
-		    ?ERROR_MSG("Cannot store file ~s from ~s for ~s: ~s",
+		    ?ERROR_MSG("Cannot store file ~ts from ~ts for ~ts: ~ts",
 			       [Path, encode_addr(IP), Host, format_error(Error)]),
 		    http_response(500)
 	    end;
 	{error, size_mismatch} ->
-	    ?WARNING_MSG("Rejecting file ~s from ~s for ~s: Unexpected size (~B)",
+	    ?WARNING_MSG("Rejecting file ~ts from ~ts for ~ts: Unexpected size (~B)",
 		      [lists:last(Slot), encode_addr(IP), Host, Length]),
 	    http_response(413);
 	{error, invalid_slot} ->
-	    ?WARNING_MSG("Rejecting file ~s from ~s for ~s: Invalid slot",
+	    ?WARNING_MSG("Rejecting file ~ts from ~ts for ~ts: Invalid slot",
 		      [lists:last(Slot), encode_addr(IP), Host]),
-	    http_response(403);
-	Error ->
-	    ?ERROR_MSG("Cannot handle PUT request from ~s for ~s: ~p",
+	    http_response(403)
+    catch
+	exit:{noproc, _} ->
+	    ?WARNING_MSG("Cannot handle PUT request from ~ts for ~ts: "
+			 "Upload not configured for this host",
+			 [encode_addr(IP), Host]),
+	    http_response(404);
+	_:Error ->
+	    ?ERROR_MSG("Cannot handle PUT request from ~ts for ~ts: ~p",
 		       [encode_addr(IP), Host, Error]),
 	    http_response(500)
     end;
@@ -423,13 +578,13 @@ process(_LocalPath, #request{method = Method, host = Host, ip = IP} = Request)
     when Method == 'GET';
 	 Method == 'HEAD' ->
     {Proc, [_UserDir, _RandDir, FileName] = Slot} = parse_http_request(Request),
-    case catch gen_server:call(Proc, get_conf, ?CALL_TIMEOUT) of
+    try gen_server:call(Proc, get_conf, ?CALL_TIMEOUT) of
 	{ok, DocRoot, CustomHeaders} ->
 	    Path = str:join([DocRoot | Slot], <<$/>>),
 	    case file:open(Path, [read]) of
 		{ok, Fd} ->
 		    file:close(Fd),
-		    ?INFO_MSG("Serving ~s to ~s", [Path, encode_addr(IP)]),
+		    ?INFO_MSG("Serving ~ts to ~ts", [Path, encode_addr(IP)]),
 		    ContentType = guess_content_type(FileName),
 		    Headers1 = case ContentType of
 				 <<"image/", _SubType/binary>> -> [];
@@ -440,58 +595,127 @@ process(_LocalPath, #request{method = Method, host = Host, ip = IP} = Request)
 					 $", FileName/binary, $">>}]
 			       end,
 		    Headers2 = [{<<"Content-Type">>, ContentType} | Headers1],
-		    Headers3 = Headers2 ++ CustomHeaders,
+		    Headers3 = ejabberd_http:apply_custom_headers(Headers2, CustomHeaders),
 		    http_response(200, Headers3, {file, Path});
 		{error, eacces} ->
-		    ?WARNING_MSG("Cannot serve ~s to ~s: Permission denied",
+		    ?WARNING_MSG("Cannot serve ~ts to ~ts: Permission denied",
 			      [Path, encode_addr(IP)]),
 		    http_response(403);
 		{error, enoent} ->
-		    ?WARNING_MSG("Cannot serve ~s to ~s: No such file",
+		    ?WARNING_MSG("Cannot serve ~ts to ~ts: No such file",
 			      [Path, encode_addr(IP)]),
 		    http_response(404);
 		{error, eisdir} ->
-		    ?WARNING_MSG("Cannot serve ~s to ~s: Is a directory",
+		    ?WARNING_MSG("Cannot serve ~ts to ~ts: Is a directory",
 			      [Path, encode_addr(IP)]),
 		    http_response(404);
 		{error, Error} ->
-		    ?WARNING_MSG("Cannot serve ~s to ~s: ~s",
+		    ?WARNING_MSG("Cannot serve ~ts to ~ts: ~ts",
 			      [Path, encode_addr(IP), format_error(Error)]),
 		    http_response(500)
-	    end;
-	Error ->
-	    ?ERROR_MSG("Cannot handle ~s request from ~s for ~s: ~p",
+	    end
+    catch
+	exit:{noproc, _} ->
+	    ?WARNING_MSG("Cannot handle ~ts request from ~ts for ~ts: "
+			 "Upload not configured for this host",
+			 [Method, encode_addr(IP), Host]),
+	    http_response(404);
+	_:Error ->
+	    ?ERROR_MSG("Cannot handle ~ts request from ~ts for ~ts: ~p",
 		       [Method, encode_addr(IP), Host, Error]),
 	    http_response(500)
     end;
 process(_LocalPath, #request{method = 'OPTIONS', host = Host,
 			     ip = IP} = Request) ->
-    ?DEBUG("Responding to OPTIONS request from ~s for ~s",
+    ?DEBUG("Responding to OPTIONS request from ~ts for ~ts",
 	   [encode_addr(IP), Host]),
     {Proc, _Slot} = parse_http_request(Request),
-    case catch gen_server:call(Proc, get_conf, ?CALL_TIMEOUT) of
+    try gen_server:call(Proc, get_conf, ?CALL_TIMEOUT) of
 	{ok, _DocRoot, CustomHeaders} ->
 	    AllowHeader = {<<"Allow">>, <<"OPTIONS, HEAD, GET, PUT">>},
-	    http_response(200, [AllowHeader | CustomHeaders]);
-	Error ->
-	    ?ERROR_MSG("Cannot handle OPTIONS request from ~s for ~s: ~p",
+	    http_response(200, ejabberd_http:apply_custom_headers([AllowHeader], CustomHeaders))
+    catch
+	exit:{noproc, _} ->
+	    ?WARNING_MSG("Cannot handle OPTIONS request from ~ts for ~ts: "
+			 "Upload not configured for this host",
+			 [encode_addr(IP), Host]),
+	    http_response(404);
+	_:Error ->
+	    ?ERROR_MSG("Cannot handle OPTIONS request from ~ts for ~ts: ~p",
 		       [encode_addr(IP), Host, Error]),
 	    http_response(500)
     end;
 process(_LocalPath, #request{method = Method, host = Host, ip = IP}) ->
-    ?DEBUG("Rejecting ~s request from ~s for ~s",
+    ?DEBUG("Rejecting ~ts request from ~ts for ~ts",
 	   [Method, encode_addr(IP), Host]),
     http_response(405, [{<<"Allow">>, <<"OPTIONS, HEAD, GET, PUT">>}]).
+
+%%--------------------------------------------------------------------
+%% State initialization
+%%--------------------------------------------------------------------
+-spec init_state(binary(), [binary()], gen_mod:opts()) -> state().
+init_state(ServerHost, Hosts, Opts) ->
+    init_state(#state{server_host = ServerHost, hosts = Hosts}, Opts).
+
+-spec init_state(state(), gen_mod:opts()) -> state().
+init_state(#state{server_host = ServerHost, hosts = Hosts} = State, Opts) ->
+    Name = mod_http_upload_opt:name(Opts),
+    Access = mod_http_upload_opt:access(Opts),
+    MaxSize = mod_http_upload_opt:max_size(Opts),
+    SecretLength = mod_http_upload_opt:secret_length(Opts),
+    JIDinURL = mod_http_upload_opt:jid_in_url(Opts),
+    DocRoot = mod_http_upload_opt:docroot(Opts),
+    FileMode = mod_http_upload_opt:file_mode(Opts),
+    DirMode = mod_http_upload_opt:dir_mode(Opts),
+    PutURL = mod_http_upload_opt:put_url(Opts),
+    GetURL = case mod_http_upload_opt:get_url(Opts) of
+		 undefined -> PutURL;
+		 URL -> URL
+	     end,
+    ServiceURL = mod_http_upload_opt:service_url(Opts),
+    Thumbnail = mod_http_upload_opt:thumbnail(Opts),
+    ExternalSecret = mod_http_upload_opt:external_secret(Opts),
+    CustomHeaders = mod_http_upload_opt:custom_headers(Opts),
+    DocRoot1 = expand_home(str:strip(DocRoot, right, $/)),
+    DocRoot2 = expand_host(DocRoot1, ServerHost),
+    case DirMode of
+	undefined ->
+	    ok;
+	Mode ->
+	    file:change_mode(DocRoot2, Mode)
+    end,
+    lists:foreach(
+      fun(Host) ->
+	      ejabberd_router:register_route(Host, ServerHost)
+      end, Hosts),
+    State#state{server_host = ServerHost, hosts = Hosts, name = Name,
+		access = Access, max_size = MaxSize,
+		secret_length = SecretLength, jid_in_url = JIDinURL,
+		file_mode = FileMode, dir_mode = DirMode,
+		thumbnail = Thumbnail,
+		docroot = DocRoot2,
+		put_url = expand_host(str:strip(PutURL, right, $/), ServerHost),
+		get_url = expand_host(str:strip(GetURL, right, $/), ServerHost),
+		service_url = ServiceURL,
+		external_secret = ExternalSecret,
+		custom_headers = CustomHeaders}.
 
 %%--------------------------------------------------------------------
 %% Exported utility functions.
 %%--------------------------------------------------------------------
 -spec get_proc_name(binary(), atom()) -> atom().
 get_proc_name(ServerHost, ModuleName) ->
-    PutURL = gen_mod:get_module_opt(ServerHost, ?MODULE, put_url),
-    {ok, {_Scheme, _UserInfo, Host, _Port, Path, _Query}} =
+    PutURL = mod_http_upload_opt:put_url(ServerHost),
+    get_proc_name(ServerHost, ModuleName, PutURL).
+
+-spec get_proc_name(binary(), atom(), binary()) -> atom().
+get_proc_name(ServerHost, ModuleName, PutURL) ->
+    %% Once we depend on OTP >= 20.0, we can use binaries with http_uri.
+    {ok, {_Scheme, _UserInfo, Host0, _Port, Path0, _Query}} =
 	http_uri:parse(binary_to_list(expand_host(PutURL, ServerHost))),
-    ProcPrefix = list_to_binary(string:strip(Host ++ Path, right, $/)),
+    Host = jid:nameprep(iolist_to_binary(Host0)),
+    Path = str:strip(iolist_to_binary(Path0), right, $/),
+    ProcPrefix = <<Host/binary, Path/binary>>,
     gen_mod:get_module_proc(ProcPrefix, ModuleName).
 
 -spec expand_home(binary()) -> binary().
@@ -517,6 +741,18 @@ process_iq(#iq{type = get, lang = Lang, sub_els = [#disco_info{}]} = IQ,
     xmpp:make_iq_result(IQ, iq_disco_info(ServerHost, Lang, Name, AddInfo));
 process_iq(#iq{type = get, sub_els = [#disco_items{}]} = IQ, _State) ->
     xmpp:make_iq_result(IQ, #disco_items{});
+process_iq(#iq{type = get, sub_els = [#vcard_temp{}], lang = Lang} = IQ,
+	   #state{server_host = ServerHost}) ->
+    VCard = case mod_http_upload_opt:vcard(ServerHost) of
+		undefined ->
+		    #vcard_temp{fn = <<"ejabberd/mod_http_upload">>,
+				url = ejabberd_config:get_uri(),
+				desc = misc:get_descr(
+					 Lang, ?T("ejabberd HTTP Upload service"))};
+		V ->
+		    V
+	    end,
+    xmpp:make_iq_result(IQ, VCard);
 process_iq(#iq{type = get, sub_els = [#upload_request{filename = File,
 						      size = Size,
 						      'content-type' = CType,
@@ -530,7 +766,7 @@ process_iq(#iq{type = get, sub_els = [#upload_request_0{filename = File,
 	   State) ->
     process_slot_request(IQ, File, Size, CType, XMLNS, State);
 process_iq(#iq{type = T, lang = Lang} = IQ, _State) when T == get; T == set ->
-    Txt = <<"No module is handling this query">>,
+    Txt = ?T("No module is handling this query"),
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang));
 process_iq(#iq{}, _State) ->
     not_request.
@@ -558,21 +794,21 @@ process_slot_request(#iq{lang = Lang, from = From} = IQ,
 		    xmpp:make_error(IQ, Error)
 	    end;
 	deny ->
-	    ?DEBUG("Denying HTTP upload slot request from ~s",
+	    ?DEBUG("Denying HTTP upload slot request from ~ts",
 		   [jid:encode(From)]),
-	    Txt = <<"Access denied by service policy">>,
+	    Txt = ?T("Access denied by service policy"),
 	    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang))
     end.
 
 -spec create_slot(state(), jid(), binary(), pos_integer(), binary(), binary(),
 		  binary())
-      -> {ok, slot()} | {ok, binary(), binary()} | {error, xmlel()}.
+      -> {ok, slot()} | {ok, binary(), binary()} | {error, xmpp_element()}.
 create_slot(#state{service_url = undefined, max_size = MaxSize},
 	    JID, File, Size, _ContentType, XMLNS, Lang)
   when MaxSize /= infinity,
        Size > MaxSize ->
-    Text = {<<"File larger than ~w bytes">>, [MaxSize]},
-    ?WARNING_MSG("Rejecting file ~s from ~s (too large: ~B bytes)",
+    Text = {?T("File larger than ~w bytes"), [MaxSize]},
+    ?WARNING_MSG("Rejecting file ~ts from ~ts (too large: ~B bytes)",
 	      [File, jid:encode(JID), Size]),
     Error = xmpp:err_not_acceptable(Text, Lang),
     Els = xmpp:get_els(Error),
@@ -593,7 +829,7 @@ create_slot(#state{service_url = undefined,
 	allow ->
 	    RandStr = p1_rand:get_alphanum_string(SecretLength),
 	    FileStr = make_file_string(File),
-	    ?INFO_MSG("Got HTTP upload slot for ~s (file: ~s, size: ~B)",
+	    ?INFO_MSG("Got HTTP upload slot for ~ts (file: ~ts, size: ~B)",
 		      [jid:encode(JID), File, Size]),
 	    {ok, [UserStr, RandStr, FileStr]};
 	deny ->
@@ -619,33 +855,33 @@ create_slot(#state{service_url = ServiceURL},
 	    case binary:split(Body, <<$\n>>, [global, trim]) of
 		[<<"http", _/binary>> = PutURL,
 		 <<"http", _/binary>> = GetURL] ->
-		    ?INFO_MSG("Got HTTP upload slot for ~s (file: ~s, size: ~B)",
+		    ?INFO_MSG("Got HTTP upload slot for ~ts (file: ~ts, size: ~B)",
 			      [jid:encode(JID), File, Size]),
 		    {ok, PutURL, GetURL};
 		Lines ->
-		    ?ERROR_MSG("Can't parse data received for ~s from <~s>: ~p",
+		    ?ERROR_MSG("Can't parse data received for ~ts from <~ts>: ~p",
 			       [jid:encode(JID), ServiceURL, Lines]),
-		    Txt = <<"Failed to parse HTTP response">>,
+		    Txt = ?T("Failed to parse HTTP response"),
 		    {error, xmpp:err_service_unavailable(Txt, Lang)}
 	    end;
 	{ok, {402, _Body}} ->
-	    ?WARNING_MSG("Got status code 402 for ~s from <~s>",
+	    ?WARNING_MSG("Got status code 402 for ~ts from <~ts>",
 		      [jid:encode(JID), ServiceURL]),
 	    {error, xmpp:err_resource_constraint()};
 	{ok, {403, _Body}} ->
-	    ?WARNING_MSG("Got status code 403 for ~s from <~s>",
+	    ?WARNING_MSG("Got status code 403 for ~ts from <~ts>",
 		      [jid:encode(JID), ServiceURL]),
 	    {error, xmpp:err_not_allowed()};
 	{ok, {413, _Body}} ->
-	    ?WARNING_MSG("Got status code 413 for ~s from <~s>",
+	    ?WARNING_MSG("Got status code 413 for ~ts from <~ts>",
 		      [jid:encode(JID), ServiceURL]),
 	    {error, xmpp:err_not_acceptable()};
 	{ok, {Code, _Body}} ->
-	    ?ERROR_MSG("Got unexpected status code for ~s from <~s>: ~B",
+	    ?ERROR_MSG("Unexpected status code for ~ts from <~ts>: ~B",
 		       [jid:encode(JID), ServiceURL, Code]),
 	    {error, xmpp:err_service_unavailable()};
 	{error, Reason} ->
-	    ?ERROR_MSG("Error requesting upload slot for ~s from <~s>: ~p",
+	    ?ERROR_MSG("Error requesting upload slot for ~ts from <~ts>: ~p",
 		       [jid:encode(JID), ServiceURL, Reason]),
 	    {error, xmpp:err_service_unavailable()}
     end.
@@ -719,7 +955,7 @@ encode_addr(IP) ->
 
 -spec iq_disco_info(binary(), binary(), binary(), [xdata()]) -> disco_info().
 iq_disco_info(Host, Lang, Name, AddInfo) ->
-    Form = case gen_mod:get_module_opt(Host, ?MODULE, max_size) of
+    Form = case mod_http_upload_opt:max_size(Host) of
 	       infinity ->
 		   AddInfo;
 	       MaxSize ->
@@ -736,6 +972,7 @@ iq_disco_info(Host, Lang, Name, AddInfo) ->
 		features = [?NS_HTTP_UPLOAD,
 			    ?NS_HTTP_UPLOAD_0,
 			    ?NS_HTTP_UPLOAD_OLD,
+			    ?NS_VCARD,
 			    ?NS_DISCO_INFO,
 			    ?NS_DISCO_ITEMS],
 		xdata = Form}.
@@ -743,7 +980,8 @@ iq_disco_info(Host, Lang, Name, AddInfo) ->
 %% HTTP request handling.
 
 -spec parse_http_request(#request{}) -> {atom(), slot()}.
-parse_http_request(#request{host = Host, path = Path}) ->
+parse_http_request(#request{host = Host0, path = Path}) ->
+    Host = jid:nameprep(Host0),
     PrefixLength = length(Path) - 3,
     {ProcURL, Slot} = if PrefixLength > 0 ->
 			      Prefix = lists:sublist(Path, PrefixLength),
@@ -762,10 +1000,10 @@ parse_http_request(#request{host = Host, path = Path}) ->
 store_file(Path, Request, FileMode, DirMode, GetPrefix, Slot, Thumbnail) ->
     case do_store_file(Path, Request, FileMode, DirMode) of
 	ok when Thumbnail ->
-	    case identify(Path) of
-		{ok, MediaInfo} ->
-		    case convert(Path, MediaInfo) of
-			{ok, OutPath, OutMediaInfo} ->
+	    case read_image(Path) of
+		{ok, Data, MediaInfo} ->
+		    case convert(Data, MediaInfo) of
+			{ok, #media_info{path = OutPath} = OutMediaInfo} ->
 			    [UserDir, RandDir | _] = Slot,
 			    FileName = filename:basename(OutPath),
 			    URL = str:join([GetPrefix, UserDir,
@@ -810,8 +1048,6 @@ do_store_file(Path, Request, FileMode, DirMode) ->
 	end
     catch
 	_:{badmatch, {error, Error}} ->
-	    {error, Error};
-	_:Error ->
 	    {error, Error}
     end.
 
@@ -832,9 +1068,9 @@ http_response(Code, ExtraHeaders) ->
     Message = <<(code_to_message(Code))/binary, $\n>>,
     http_response(Code, ExtraHeaders, Message).
 
--type http_body() :: binary() | {file, file:filename()}.
+-type http_body() :: binary() | {file, file:filename_all()}.
 -spec http_response(100..599, [{binary(), binary()}], http_body())
-      -> {pos_integer(), [{binary(), binary()}], binary()}.
+      -> {pos_integer(), [{binary(), binary()}], http_body()}.
 http_response(Code, ExtraHeaders, Body) ->
     Headers = case proplists:is_defined(<<"Content-Type">>, ExtraHeaders) of
 		  true ->
@@ -870,35 +1106,36 @@ format_error(Reason) ->
 %%--------------------------------------------------------------------
 %% Image manipulation stuff.
 %%--------------------------------------------------------------------
--spec identify(binary()) -> {ok, media_info()} | pass.
-identify(Path) ->
-    try
-	{ok, Fd} = file:open(Path, [read, raw]),
-	{ok, Data} = file:read(Fd, 1024),
-	case eimp:identify(Data) of
-	    {ok, Info} ->
-		{ok, #media_info{
+-spec read_image(binary()) -> {ok, binary(), media_info()} | pass.
+read_image(Path) ->
+    case file:read_file(Path) of
+	{ok, Data} ->
+	    case eimp:identify(Data) of
+		{ok, Info} ->
+		    {ok, Data,
+		     #media_info{
+			path = Path,
 			type = proplists:get_value(type, Info),
 			width = proplists:get_value(width, Info),
 			height = proplists:get_value(height, Info)}};
-	    {error, Why} ->
-		?DEBUG("Cannot identify type of ~s: ~s",
-		       [Path, eimp:format_error(Why)]),
-		pass
-	end
-    catch _:{badmatch, {error, Reason}} ->
-	    ?DEBUG("Failed to read file ~s: ~s",
+		{error, Why} ->
+		    ?DEBUG("Cannot identify type of ~ts: ~ts",
+			   [Path, eimp:format_error(Why)]),
+		    pass
+	    end;
+	{error, Reason} ->
+	    ?DEBUG("Failed to read file ~ts: ~ts",
 		   [Path, format_error(Reason)]),
 	    pass
     end.
 
--spec convert(binary(), media_info()) -> {ok, binary(), media_info()} | pass.
-convert(Path, #media_info{type = T, width = W, height = H} = Info) ->
+-spec convert(binary(), media_info()) -> {ok, media_info()} | pass.
+convert(InData, #media_info{path = Path, type = T, width = W, height = H} = Info) ->
     if W * H >= 25000000 ->
-	    ?DEBUG("The image ~s is more than 25 Mpix", [Path]),
+	    ?DEBUG("The image ~ts is more than 25 Mpix", [Path]),
 	    pass;
        W =< 300, H =< 300 ->
-	    {ok, Path, Info};
+	    {ok, Info};
        true ->
 	    Dir = filename:dirname(Path),
 	    Ext = atom_to_binary(T, latin1),
@@ -908,27 +1145,20 @@ convert(Path, #media_info{type = T, width = W, height = H} = Info) ->
 			  H > W -> {round(W*300/H), 300};
 			  true -> {300, 300}
 		       end,
-	    OutInfo = #media_info{type = T, width = W1, height = H1},
-	    case file:read_file(Path) of
-		{ok, Data} ->
-		    case eimp:convert(Data, T, [{scale, {W1, H1}}]) of
-			{ok, OutData} ->
-			    case file:write_file(OutPath, OutData) of
-				ok ->
-				    {ok, OutPath, OutInfo};
-				{error, Why} ->
-				    ?ERROR_MSG("Failed to write to ~s: ~s",
-					       [OutPath, format_error(Why)]),
-				    pass
-			    end;
+	    OutInfo = #media_info{path = OutPath, type = T, width = W1, height = H1},
+	    case eimp:convert(InData, T, [{scale, {W1, H1}}]) of
+		{ok, OutData} ->
+		    case file:write_file(OutPath, OutData) of
+			ok ->
+			    {ok, OutInfo};
 			{error, Why} ->
-			    ?ERROR_MSG("Failed to convert ~s to ~s: ~s",
-				       [Path, OutPath, eimp:format_error(Why)]),
+			    ?ERROR_MSG("Failed to write to ~ts: ~ts",
+				       [OutPath, format_error(Why)]),
 			    pass
 		    end;
 		{error, Why} ->
-		    ?ERROR_MSG("Failed to read file ~s: ~s",
-			       [Path, format_error(Why)]),
+		    ?ERROR_MSG("Failed to convert ~ts to ~ts: ~ts",
+			       [Path, OutPath, eimp:format_error(Why)]),
 		    pass
 	    end
     end.
@@ -946,40 +1176,18 @@ thumb_el(#media_info{type = T, height = H, width = W}, URI) ->
 -spec remove_user(binary(), binary()) -> ok.
 remove_user(User, Server) ->
     ServerHost = jid:nameprep(Server),
-    DocRoot = gen_mod:get_module_opt(ServerHost, ?MODULE, docroot),
-    JIDinURL = gen_mod:get_module_opt(ServerHost, ?MODULE, jid_in_url),
+    DocRoot = mod_http_upload_opt:docroot(ServerHost),
+    JIDinURL = mod_http_upload_opt:jid_in_url(ServerHost),
     DocRoot1 = expand_host(expand_home(DocRoot), ServerHost),
     UserStr = make_user_string(jid:make(User, Server), JIDinURL),
     UserDir = str:join([DocRoot1, UserStr], <<$/>>),
-    case del_tree(UserDir) of
+    case misc:delete_dir(UserDir) of
 	ok ->
-	    ?INFO_MSG("Removed HTTP upload directory of ~s@~s", [User, Server]);
+	    ?INFO_MSG("Removed HTTP upload directory of ~ts@~ts", [User, Server]);
 	{error, enoent} ->
-	    ?DEBUG("Found no HTTP upload directory of ~s@~s", [User, Server]);
+	    ?DEBUG("Found no HTTP upload directory of ~ts@~ts", [User, Server]);
 	{error, Error} ->
-	    ?ERROR_MSG("Cannot remove HTTP upload directory of ~s@~s: ~s",
+	    ?ERROR_MSG("Cannot remove HTTP upload directory of ~ts@~ts: ~ts",
 		       [User, Server, format_error(Error)])
     end,
     ok.
-
--spec del_tree(file:filename_all()) -> ok | {error, term()}.
-del_tree(Dir) when is_binary(Dir) ->
-    del_tree(binary_to_list(Dir));
-del_tree(Dir) ->
-    try
-	{ok, Entries} = file:list_dir(Dir),
-	lists:foreach(fun(Path) ->
-			      case filelib:is_dir(Path) of
-				  true ->
-				      ok = del_tree(Path);
-				  false ->
-				      ok = file:delete(Path)
-			      end
-		      end, [Dir ++ "/" ++ Entry || Entry <- Entries]),
-	ok = file:del_dir(Dir)
-    catch
-	_:{badmatch, {error, Error}} ->
-	    {error, Error};
-	_:Error ->
-	    {error, Error}
-    end.

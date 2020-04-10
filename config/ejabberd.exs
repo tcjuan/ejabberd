@@ -12,9 +12,9 @@ defmodule Ejabberd.ConfigFile do
      language: "en",
      allow_contrib_modules: true,
      hosts: ["localhost"],
-     shaper: shaper,
-     acl: acl,
-     access: access]
+     shaper: shaper(),
+     acl: acl(),
+     access: access()]
   end
 
   defp shaper do
@@ -61,7 +61,6 @@ defmodule Ejabberd.ConfigFile do
     @opts [
       port: 5280,
       web_admin: true,
-      http_poll: true,
       http_bind: true,
       captcha: true]
   end
@@ -132,9 +131,10 @@ defmodule Ejabberd.ConfigFile do
   module :mod_register do
     @opts [welcome_message: [
       subject: "Welcome!",
-      body: "Hi.\nWelcome to this XMPP Server",
+      body: "Hi.\nWelcome to this XMPP Server"
+      ],
       ip_access: :trusted_network,
-      access: :register]]
+      access: :register] 
   end
 
   module :mod_roster do

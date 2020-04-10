@@ -5,7 +5,7 @@
 %%% Created : 24 Aug 2008 by Stephan Maka <stephan@spaceboyz.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,13 +30,12 @@
 -protocol({xep, 191, '1.2'}).
 
 -export([start/2, stop/1, reload/3, process_iq/1, depends/2,
-	 disco_features/5, mod_options/1]).
+	 disco_features/5, mod_options/1, mod_doc/0]).
 
 -include("logger.hrl").
-
 -include("xmpp.hrl").
-
 -include("mod_privacy.hrl").
+-include("translate.hrl").
 
 start(Host, _Opts) ->
     ejabberd_hooks:add(disco_local_features, Host, ?MODULE, disco_features, 50),
@@ -74,21 +73,21 @@ process_iq(#iq{type = Type,
 	set -> process_iq_set(IQ)
     end;
 process_iq(#iq{lang = Lang} = IQ) ->
-    Txt = <<"Query to another users is forbidden">>,
+    Txt = ?T("Query to another users is forbidden"),
     xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang)).
 
 -spec process_iq_get(iq()) -> iq().
 process_iq_get(#iq{sub_els = [#block_list{}]} = IQ) ->
     process_get(IQ);
 process_iq_get(#iq{lang = Lang} = IQ) ->
-    Txt = <<"No module is handling this query">>,
+    Txt = ?T("No module is handling this query"),
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
 
 -spec process_iq_set(iq()) -> iq().
 process_iq_set(#iq{lang = Lang, sub_els = [SubEl]} = IQ) ->
     case SubEl of
 	#block{items = []} ->
-	    Txt = <<"No items found in this query">>,
+	    Txt = ?T("No items found in this query"),
 	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
 	#block{items = Items} ->
 	    JIDs = [jid:tolower(JID) || #block_item{jid = JID} <- Items],
@@ -99,7 +98,7 @@ process_iq_set(#iq{lang = Lang, sub_els = [SubEl]} = IQ) ->
 	    JIDs = [jid:tolower(JID) || #block_item{jid = JID} <- Items],
 	    process_unblock(IQ, JIDs);
 	_ ->
-	    Txt = <<"No module is handling this query">>,
+	    Txt = ?T("No module is handling this query"),
 	    xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang))
     end.
 
@@ -167,7 +166,7 @@ process_block(#iq{from = From} = IQ, LJIDs) ->
 			    broadcast_event(From, #block{items = Items}),
 			    xmpp:make_iq_result(IQ);
 			{error, notfound} ->
-			    ?ERROR_MSG("Failed to set default list '~s': "
+			    ?ERROR_MSG("Failed to set default list '~ts': "
 				       "the list should exist, but not found",
 				       [Name]),
 			    err_db_failure(IQ);
@@ -259,9 +258,18 @@ process_get(#iq{from = #jid{luser = LUser, lserver = LServer}} = IQ) ->
 	    err_db_failure(IQ)
     end.
 
+-spec err_db_failure(iq()) -> iq().
 err_db_failure(#iq{lang = Lang} = IQ) ->
-    Txt = <<"Database failure">>,
+    Txt = ?T("Database failure"),
     xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang)).
 
 mod_options(_Host) ->
     [].
+
+mod_doc() ->
+    #{desc =>
+          [?T("The module implements "
+              "https://xmpp.org/extensions/xep-0191.html"
+              "[XEP-0191: Blocking Command]."), "",
+           ?T("This module depends on 'mod_privacy' where "
+              "all the configuration is performed.")]}.

@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,7 +30,6 @@
 -behaviour(gen_pubsub_node).
 -author('christophe.romain@process-one.net').
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 -include("pubsub.hrl").
 -include("ejabberd_sql_pt.hrl").
@@ -47,7 +46,8 @@
     set_state/1, get_items/7, get_items/3, get_item/7,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1, depends/3,
-    get_entity_subscriptions_for_send_last/2, get_last_items/3]).
+    get_entity_subscriptions_for_send_last/2, get_last_items/3,
+    get_only_item/2]).
 
 depends(_Host, _ServerHost, _Opts) ->
     [{mod_caps, hard}].
@@ -74,8 +74,7 @@ create_node(Nidx, Owner) ->
     {result, {default, broadcast}}.
 
 delete_node(Nodes) ->
-    {result, {_, _, Result}} = node_flat_sql:delete_node(Nodes),
-    {result, {default, Result}}.
+    node_flat_sql:delete_node(Nodes).
 
 subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 	    SendLast, PresenceSubscription, RosterGroup, Options) ->
@@ -126,13 +125,13 @@ get_entity_subscriptions(_Host, Owner) ->
 		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
 		     "from pubsub_state i, pubsub_node n "
 		     "where i.nodeid = n.nodeid and "
-		     "(jid=%(GJ)s or jid like %(GJLike)s escape '^') and host like %(HLike)s escape '^'");
+		     "(jid=%(GJ)s or jid like %(GJLike)s %ESCAPE) and host like %(HLike)s %ESCAPE");
 	      _ ->
 		SJ = node_flat_sql:encode_jid(SubKey),
 		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
 		     "from pubsub_state i, pubsub_node n "
 		     "where i.nodeid = n.nodeid and "
-		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s escape '^'")
+		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s %ESCAPE")
 	    end,
     {result,
      case ejabberd_sql:sql_query_t(Query) of
@@ -163,14 +162,14 @@ get_entity_subscriptions_for_send_last(_Host, Owner) ->
 		     "from pubsub_state i, pubsub_node n, pubsub_node_option o "
 		     "where i.nodeid = n.nodeid and n.nodeid = o.nodeid and "
 		     "name='send_last_published_item' and val='on_sub_and_presence' and "
-		     "(jid=%(GJ)s or jid like %(GJLike)s escape '^') and host like %(HLike)s escape '^'");
+		     "(jid=%(GJ)s or jid like %(GJLike)s %ESCAPE) and host like %(HLike)s %ESCAPE");
 	      _ ->
 		SJ = node_flat_sql:encode_jid(SubKey),
 		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
 		     "from pubsub_state i, pubsub_node n, pubsub_node_option o "
 		     "where i.nodeid = n.nodeid and n.nodeid = o.nodeid and "
 		     "name='send_last_published_item' and val='on_sub_and_presence' and "
-		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s escape '^'")
+		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s %ESCAPE")
 	    end,
     {result,
      case ejabberd_sql:sql_query_t(Query) of
@@ -219,6 +218,9 @@ get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM)
 
 get_last_items(Nidx, JID, Count) ->
     node_flat_sql:get_last_items(Nidx, JID, Count).
+
+get_only_item(Nidx, JID) ->
+    node_flat_sql:get_only_item(Nidx, JID).
 
 get_item(Nidx, ItemId) ->
     node_flat_sql:get_item(Nidx, ItemId).

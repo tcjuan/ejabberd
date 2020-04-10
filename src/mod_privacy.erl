@@ -5,7 +5,7 @@
 %%% Created : 21 Jul 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -36,13 +36,14 @@
 	 check_packet/4, remove_user/2, encode_list_item/1,
          get_user_lists/2, get_user_list/3,
 	 set_list/1, set_list/4, set_default_list/3,
-	 user_send_packet/1, user_receive_packet/1,
+	 user_send_packet/1, mod_doc/0,
 	 import_start/2, import_stop/2, import/5, import_info/0,
 	 mod_opt_type/1, mod_options/1, depends/2]).
 
 -include("logger.hrl").
 -include("xmpp.hrl").
 -include("mod_privacy.hrl").
+-include("translate.hrl").
 
 -define(PRIVACY_CACHE, privacy_cache).
 -define(PRIVACY_LIST_CACHE, privacy_list_cache).
@@ -57,7 +58,7 @@
           ok | {error, notfound | conflict | any()}.
 -callback remove_lists(binary(), binary()) -> ok | {error, any()}.
 -callback set_lists(#privacy{}) -> ok | {error, any()}.
--callback set_list(binary(), binary(), binary(), listitem()) ->
+-callback set_list(binary(), binary(), binary(), [listitem()]) ->
           ok | {error, any()}.
 -callback get_list(binary(), binary(), binary() | default) ->
           {ok, {binary(), [listitem()]}} | error | {error, any()}.
@@ -69,7 +70,7 @@
 -optional_callbacks([use_cache/1, cache_nodes/1]).
 
 start(Host, Opts) ->
-    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
+    Mod = gen_mod:db_mod(Opts, ?MODULE),
     Mod:init(Host, Opts),
     init_cache(Mod, Host, Opts),
     ejabberd_hooks:add(disco_local_features, Host, ?MODULE,
@@ -78,8 +79,6 @@ start(Host, Opts) ->
 		       c2s_copy_session, 50),
     ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
 		       user_send_packet, 50),
-    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE,
-		       user_receive_packet, 50),
     ejabberd_hooks:add(privacy_check_packet, Host, ?MODULE,
 		       check_packet, 50),
     ejabberd_hooks:add(remove_user, Host, ?MODULE,
@@ -94,8 +93,6 @@ stop(Host) ->
 			  c2s_copy_session, 50),
     ejabberd_hooks:delete(user_send_packet, Host, ?MODULE,
 			  user_send_packet, 50),
-    ejabberd_hooks:delete(user_receive_packet, Host, ?MODULE,
-			  user_receive_packet, 50),
     ejabberd_hooks:delete(privacy_check_packet, Host,
 			  ?MODULE, check_packet, 50),
     ejabberd_hooks:delete(remove_user, Host, ?MODULE,
@@ -104,8 +101,8 @@ stop(Host) ->
 				     ?NS_PRIVACY).
 
 reload(Host, NewOpts, OldOpts) ->
-    NewMod = gen_mod:db_mod(Host, NewOpts, ?MODULE),
-    OldMod = gen_mod:db_mod(Host, OldOpts, ?MODULE),
+    NewMod = gen_mod:db_mod(NewOpts, ?MODULE),
+    OldMod = gen_mod:db_mod(OldOpts, ?MODULE),
     if NewMod /= OldMod ->
 	    NewMod:init(Host, NewOpts);
        true ->
@@ -134,7 +131,7 @@ process_iq(#iq{type = Type,
 	set -> process_iq_set(IQ)
     end;
 process_iq(#iq{lang = Lang} = IQ) ->
-    Txt = <<"Query to another users is forbidden">>,
+    Txt = ?T("Query to another users is forbidden"),
     xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang)).
 
 -spec process_iq_get(iq()) -> iq().
@@ -142,7 +139,7 @@ process_iq_get(#iq{lang = Lang,
 		      sub_els = [#privacy_query{default = Default,
 					     active = Active}]} = IQ)
   when Default /= undefined; Active /= undefined ->
-    Txt = <<"Only <list/> element is allowed in this query">>,
+    Txt = ?T("Only <list/> element is allowed in this query"),
     xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
 process_iq_get(#iq{lang = Lang,
 		   sub_els = [#privacy_query{lists = Lists}]} = IQ) ->
@@ -152,11 +149,11 @@ process_iq_get(#iq{lang = Lang,
 	[#privacy_list{name = ListName}] ->
 	    process_list_get(IQ, ListName);
 	_ ->
-	    Txt = <<"Too many <list/> elements">>,
+	    Txt = ?T("Too many <list/> elements"),
 	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang))
     end;
 process_iq_get(#iq{lang = Lang} = IQ) ->
-    Txt = <<"No module is handling this query">>,
+    Txt = ?T("No module is handling this query"),
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
 
 -spec process_lists_get(iq()) -> iq().
@@ -174,7 +171,7 @@ process_lists_get(#iq{from = #jid{luser = LUser, lserver = LServer},
 	    xmpp:make_iq_result(
 	      IQ, #privacy_query{active = none, default = none});
 	{error, _} ->
-	    Txt = <<"Database failure">>,
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end.
 
@@ -189,10 +186,10 @@ process_list_get(#iq{from = #jid{luser = LUser, lserver = LServer},
 	      #privacy_query{
 		 lists = [#privacy_list{name = Name, items = Items}]});
 	error ->
-	    Txt = <<"No privacy list with this name found">>,
+	    Txt = ?T("No privacy list with this name found"),
 	    xmpp:make_error(IQ, xmpp:err_item_not_found(Txt, Lang));
 	{error, _} ->
-	    Txt = <<"Database failure">>,
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end.
 
@@ -268,12 +265,12 @@ process_iq_set(#iq{lang = Lang,
 	[] when Active == undefined, Default /= undefined ->
 	    process_default_set(IQ, Default);
 	_ ->
-	    Txt = <<"The stanza MUST contain only one <active/> element, "
-		    "one <default/> element, or one <list/> element">>,
+	    Txt = ?T("The stanza MUST contain only one <active/> element, "
+		     "one <default/> element, or one <list/> element"),
 	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang))
     end;
 process_iq_set(#iq{lang = Lang} = IQ) ->
-    Txt = <<"No module is handling this query">>,
+    Txt = ?T("No module is handling this query"),
     xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
 
 -spec process_default_set(iq(), none | binary()) -> iq().
@@ -283,10 +280,10 @@ process_default_set(#iq{from = #jid{luser = LUser, lserver = LServer},
 	ok ->
 	    xmpp:make_iq_result(IQ);
 	{error, notfound} ->
-	    Txt = <<"No privacy list with this name found">>,
+	    Txt = ?T("No privacy list with this name found"),
 	    xmpp:make_error(IQ, xmpp:err_item_not_found(Txt, Lang));
 	{error, _} ->
-	    Txt = <<"Database failure">>,
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end.
 
@@ -299,10 +296,10 @@ process_active_set(#iq{from = #jid{luser = LUser, lserver = LServer},
 	{ok, _} ->
 	    xmpp:make_iq_result(xmpp:put_meta(IQ, privacy_active_list, Name));
 	error ->
-	    Txt = <<"No privacy list with this name found">>,
+	    Txt = ?T("No privacy list with this name found"),
 	    xmpp:make_error(IQ, xmpp:err_item_not_found(Txt, Lang));
 	{error, _} ->
-	    Txt = <<"Database failure">>,
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end.
 
@@ -322,20 +319,20 @@ process_lists_set(#iq{from = #jid{luser = LUser, lserver = LServer},
 		      lang = Lang} = IQ, Name, []) ->
     case xmpp:get_meta(IQ, privacy_active_list, none) of
 	Name ->
-	    Txt = <<"Cannot remove active list">>,
+	    Txt = ?T("Cannot remove active list"),
 	    xmpp:make_error(IQ, xmpp:err_conflict(Txt, Lang));
 	_ ->
 	    case remove_list(LUser, LServer, Name) of
 		ok ->
 		    xmpp:make_iq_result(IQ);
 		{error, conflict} ->
-		    Txt = <<"Cannot remove default list">>,
+		    Txt = ?T("Cannot remove default list"),
 		    xmpp:make_error(IQ, xmpp:err_conflict(Txt, Lang));
 		{error, notfound} ->
-		    Txt = <<"No privacy list with this name found">>,
+		    Txt = ?T("No privacy list with this name found"),
 		    xmpp:make_error(IQ, xmpp:err_item_not_found(Txt, Lang));
 		{error, _} ->
-		    Txt = <<"Database failure">>,
+		    Txt = ?T("Database failure"),
 		    Err = xmpp:err_internal_server_error(Txt, Lang),
 		    xmpp:make_error(IQ, Err)
 	    end
@@ -352,7 +349,7 @@ process_lists_set(#iq{from = #jid{luser = LUser, lserver = LServer} = From,
 		    push_list_update(From, Name),
 		    xmpp:make_iq_result(IQ);
 		{error, _} ->
-		    Txt = <<"Database failure">>,
+		    Txt = ?T("Database failure"),
 		    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
 	    end
     end.
@@ -407,6 +404,41 @@ c2s_copy_session(State, #{privacy_active_list := List}) ->
 c2s_copy_session(State, _) ->
     State.
 
+%% Adjust the client's state, so next packets (which can be already queued)
+%% will take the active list into account.
+-spec update_c2s_state_with_privacy_list(stanza(), c2s_state()) -> c2s_state().
+update_c2s_state_with_privacy_list(#iq{type = set,
+				       to = #jid{luser = U, lserver = S,
+						 lresource = <<"">>} = To} = IQ,
+				   State) ->
+    %% Match a IQ set containing a new active privacy list
+    case xmpp:get_subtag(IQ, #privacy_query{}) of
+	#privacy_query{default = undefined, active = Active} ->
+	    case Active of
+		none ->
+		    ?DEBUG("Removing active privacy list for user: ~ts",
+			   [jid:encode(To)]),
+		    State#{privacy_active_list => none};
+		undefined ->
+		    State;
+		_ ->
+		    case get_user_list(U, S, Active) of
+			{ok, _} ->
+			    ?DEBUG("Setting active privacy list '~ts' for user: ~ts",
+				   [Active, jid:encode(To)]),
+			    State#{privacy_active_list => Active};
+			_ ->
+			    %% unknown privacy list name
+			    State
+		    end
+	    end;
+	_ ->
+	    State
+    end;
+update_c2s_state_with_privacy_list(_Packet, State) ->
+    State.
+
+%% Add the active privacy list to packet metadata
 -spec user_send_packet({stanza(), c2s_state()}) -> {stanza(), c2s_state()}.
 user_send_packet({#iq{type = Type,
 		      to = #jid{luser = U, lserver = S, lresource = <<"">>},
@@ -418,16 +450,11 @@ user_send_packet({#iq{type = Type,
 		true -> xmpp:put_meta(IQ, privacy_active_list, Name);
 		false -> IQ
 	    end,
-    {NewIQ, State};
-user_send_packet(Acc) ->
-    Acc.
-
--spec user_receive_packet({stanza(), c2s_state()}) -> {stanza(), c2s_state()}.
-user_receive_packet({#iq{type = result,
-			 meta = #{privacy_active_list := Name}} = IQ, State}) ->
-    {IQ, State#{privacy_active_list => Name}};
-user_receive_packet(Acc) ->
-    Acc.
+    {NewIQ, update_c2s_state_with_privacy_list(IQ, State)};
+%% For client with no active privacy list, see if there is
+%% one about to be activated in this packet and update client state
+user_send_packet({Packet, State}) ->
+    {Packet, update_c2s_state_with_privacy_list(Packet, State)}.
 
 -spec set_list(binary(), binary(), binary(), [listitem()]) -> ok | {error, any()}.
 set_list(LUser, LServer, Name, List) ->
@@ -521,8 +548,8 @@ check_packet(Acc, #{jid := JID} = State, Packet, Dir) ->
 		{ok, {_, List}} ->
 		    do_check_packet(JID, List, Packet, Dir);
 		_ ->
-		    ?DEBUG("Non-existing active list '~s' is set "
-			   "for user '~s'", [ListName, jid:encode(JID)]),
+		    ?DEBUG("Non-existing active list '~ts' is set "
+			   "for user '~ts'", [ListName, jid:encode(JID)]),
 		    check_packet(Acc, JID, Packet, Dir)
 	    end
     end;
@@ -591,7 +618,7 @@ do_check_packet(#jid{luser = LUser, lserver = LServer}, List, Packet, Dir) ->
 		       message | iq | presence_in | presence_out | other,
 		       ljid(), none | both | from | to, [binary()]) ->
 			      allow | deny.
-%% Ptype = mesage | iq | presence_in | presence_out | other
+%% Ptype = message | iq | presence_in | presence_out | other
 check_packet_aux([], _PType, _JID, _Subscription,
 		 _Groups) ->
     allow;
@@ -683,19 +710,16 @@ init_cache(Mod, Host, Opts) ->
 
 -spec cache_opts(gen_mod:opts()) -> [proplists:property()].
 cache_opts(Opts) ->
-    MaxSize = gen_mod:get_opt(cache_size, Opts),
-    CacheMissed = gen_mod:get_opt(cache_missed, Opts),
-    LifeTime = case gen_mod:get_opt(cache_life_time, Opts) of
-		   infinity -> infinity;
-		   I -> timer:seconds(I)
-	       end,
+    MaxSize = mod_privacy_opt:cache_size(Opts),
+    CacheMissed = mod_privacy_opt:cache_missed(Opts),
+    LifeTime = mod_privacy_opt:cache_life_time(Opts),
     [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
 
 -spec use_cache(module(), binary()) -> boolean().
 use_cache(Mod, Host) ->
     case erlang:function_exported(Mod, use_cache, 1) of
 	true -> Mod:use_cache(Host);
-	false -> gen_mod:get_module_opt(Host, ?MODULE, use_cache)
+	false -> mod_privacy_opt:use_cache(Host)
     end.
 
 -spec cache_nodes(module(), binary()) -> [node()].
@@ -827,17 +851,52 @@ export(LServer) ->
 depends(_Host, _Opts) ->
     [].
 
-mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
-mod_opt_type(O) when O == cache_life_time; O == cache_size ->
-    fun (I) when is_integer(I), I > 0 -> I;
-        (infinity) -> infinity
-    end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun (B) when is_boolean(B) -> B end.
+mod_opt_type(db_type) ->
+    econf:db_type(?MODULE);
+mod_opt_type(use_cache) ->
+    econf:bool();
+mod_opt_type(cache_size) ->
+    econf:pos_int(infinity);
+mod_opt_type(cache_missed) ->
+    econf:bool();
+mod_opt_type(cache_life_time) ->
+    econf:timeout(second, infinity).
 
 mod_options(Host) ->
     [{db_type, ejabberd_config:default_db(Host, ?MODULE)},
-     {use_cache, ejabberd_config:use_cache(Host)},
-     {cache_size, ejabberd_config:cache_size(Host)},
-     {cache_missed, ejabberd_config:cache_missed(Host)},
-     {cache_life_time, ejabberd_config:cache_life_time(Host)}].
+     {use_cache, ejabberd_option:use_cache(Host)},
+     {cache_size, ejabberd_option:cache_size(Host)},
+     {cache_missed, ejabberd_option:cache_missed(Host)},
+     {cache_life_time, ejabberd_option:cache_life_time(Host)}].
+
+mod_doc() ->
+    #{desc =>
+          [?T("This module implements "
+              "https://xmpp.org/extensions/xep-0016.html"
+              "[XEP-0016: Privacy Lists]."), "",
+           ?T("NOTE: Nowadays modern XMPP clients rely on "
+              "https://xmpp.org/extensions/xep-0191.html"
+              "[XEP-0191: Blocking Command] which is implemented by "
+              "'mod_blocking' module. However, you still need "
+              "'mod_privacy' loaded in order for 'mod_blocking' to work.")],
+      opts =>
+          [{db_type,
+            #{value => "mnesia | sql",
+              desc =>
+                  ?T("Same as top-level 'default_db' option, but applied to this module only.")}},
+           {use_cache,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level 'use_cache' option, but applied to this module only.")}},
+           {cache_size,
+            #{value => "pos_integer() | infinity",
+              desc =>
+                  ?T("Same as top-level 'cache_size' option, but applied to this module only.")}},
+           {cache_missed,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level 'cache_missed' option, but applied to this module only.")}},
+           {cache_life_time,
+            #{value => "timeout()",
+              desc =>
+                  ?T("Same as top-level 'cache_life_time' option, but applied to this module only.")}}]}.

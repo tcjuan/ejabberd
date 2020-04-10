@@ -15,7 +15,7 @@ defmodule Mix.Tasks.Ejabberd.Deps.Tree do
     # First we need to start manually the store to be available
     # during the compilation of the config file.
     Ejabberd.Config.Store.start_link
-    Ejabberd.Config.init(:ejabberd_config.get_ejabberd_config_path())
+    Ejabberd.Config.init(:ejabberd_config.path())
 
     Mix.shell.info "ejabberd modules"
 
@@ -40,7 +40,7 @@ defmodule Mix.Tasks.Ejabberd.Deps.Tree do
     end
   end
 
-  defp build_dependency_tree(mods, mod, []), do: %{module: mod, dependency: []}
+  defp build_dependency_tree(_mods, mod, []), do: %{module: mod, dependency: []}
   defp build_dependency_tree(mods, mod, deps) when is_list(deps) do
     dependencies = Enum.map deps, fn dep ->
       dep_deps = get_dependencies_of_mod(mods, dep)
@@ -65,7 +65,7 @@ defmodule Mix.Tasks.Ejabberd.Deps.Tree do
 
   defp keep_only_mods_not_used_as_dep(mods, mods_used_as_dep) do
     Enum.filter mods, fn %{module: mod} ->
-      not mod in mods_used_as_dep
+      not (mod in mods_used_as_dep)
     end
   end
 

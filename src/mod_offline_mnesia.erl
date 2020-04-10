@@ -4,7 +4,7 @@
 %%% Created : 15 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -63,7 +63,7 @@ pop_messages(LUser, LServer) ->
     end.
 
 remove_expired_messages(_LServer) ->
-    TimeStamp = p1_time_compat:timestamp(),
+    TimeStamp = erlang:timestamp(),
     F = fun () ->
 		mnesia:write_lock_table(offline_msg),
 		mnesia:foldl(fun (Rec, _Acc) ->
@@ -81,7 +81,7 @@ remove_expired_messages(_LServer) ->
     mnesia:transaction(F).
 
 remove_old_messages(Days, _LServer) ->
-    S = p1_time_compat:system_time(seconds) - 60 * 60 * 24 * Days,
+    S = erlang:system_time(second) - 60 * 60 * 24 * Days,
     MegaSecs1 = S div 1000000,
     Secs1 = S rem 1000000,
     TimeStamp = {MegaSecs1, Secs1, 0},
@@ -156,20 +156,26 @@ count_messages(LUser, LServer) ->
     F = fun () ->
 		count_mnesia_records(US)
 	end,
-    case catch mnesia:async_dirty(F) of
-	I when is_integer(I) -> I;
-	_ -> 0
-    end.
+    {cache, case mnesia:async_dirty(F) of
+		I when is_integer(I) -> I;
+		_ -> 0
+	    end}.
 
 import(#offline_msg{} = Msg) ->
     mnesia:dirty_write(Msg).
 
-need_transform(#offline_msg{us = {U, S}}) when is_list(U) orelse is_list(S) ->
+need_transform({offline_msg, {U, S}, _, _, _, _, _})
+  when is_list(U) orelse is_list(S) ->
     ?INFO_MSG("Mnesia table 'offline_msg' will be converted to binary", []),
+    true;
+need_transform({offline_msg, _, _, _, _, _, _, _}) ->
     true;
 need_transform(_) ->
     false.
 
+transform({offline_msg, {U, S}, Timestamp, Expire, From, To, _, Packet}) ->
+    #offline_msg{us = {U, S}, timestamp = Timestamp, expire = Expire,
+		 from = From ,to = To, packet = Packet};
 transform(#offline_msg{us = {U, S}, from = From, to = To,
 		       packet = El} = R) ->
     R#offline_msg{us = {iolist_to_binary(U), iolist_to_binary(S)},

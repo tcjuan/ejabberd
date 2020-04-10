@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,7 +26,6 @@
 
 -behaviour(mod_announce).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/2, set_motd_users/2, set_motd/2, delete_motd/1,
@@ -155,7 +154,7 @@ parse_element(XML) ->
         El when is_record(El, xmlel) ->
             {ok, El};
         _ ->
-            ?ERROR_MSG("malformed XML element in SQL table "
-                       "'motd' for username='': ~s", [XML]),
+            ?ERROR_MSG("Malformed XML element in SQL table "
+                       "'motd' for username='': ~ts", [XML]),
             {error, db_failure}
     end.

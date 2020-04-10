@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,6 @@
 
 -module(mod_vcard_sql).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 -behaviour(mod_vcard).
 
@@ -264,10 +263,11 @@ make_matchspec(LServer, Data) ->
 filter_fields([], Match, LServer) ->
     case ejabberd_sql:use_new_schema() of
         true ->
-            SServer = ejabberd_sql:escape(LServer),
+            SQLType = ejabberd_option:sql_type(LServer),
+            SServer = ejabberd_sql:to_string_literal(SQLType, LServer),
             case Match of
-                <<"">> -> [<<"where server_host='">>, SServer, <<"'">>];
-                _ -> [<<" where server_host='">>, SServer, <<"' and ">>, Match]
+                <<"">> -> [<<"where server_host=">>, SServer];
+                _ -> [<<" where server_host=">>, SServer, <<" and ">>, Match]
             end;
         false ->
             case Match of
@@ -279,26 +279,26 @@ filter_fields([{SVar, [Val]} | Ds], Match, LServer)
   when is_binary(Val) and (Val /= <<"">>) ->
     LVal = mod_vcard:string2lower(Val),
     NewMatch = case SVar of
-		   <<"user">> -> make_val(Match, <<"lusername">>, LVal);
-		   <<"fn">> -> make_val(Match, <<"lfn">>, LVal);
-		   <<"last">> -> make_val(Match, <<"lfamily">>, LVal);
-		   <<"first">> -> make_val(Match, <<"lgiven">>, LVal);
-		   <<"middle">> -> make_val(Match, <<"lmiddle">>, LVal);
-		   <<"nick">> -> make_val(Match, <<"lnickname">>, LVal);
-		   <<"bday">> -> make_val(Match, <<"lbday">>, LVal);
-		   <<"ctry">> -> make_val(Match, <<"lctry">>, LVal);
+		   <<"user">> -> make_val(LServer, Match, <<"lusername">>, LVal);
+		   <<"fn">> -> make_val(LServer, Match, <<"lfn">>, LVal);
+		   <<"last">> -> make_val(LServer, Match, <<"lfamily">>, LVal);
+		   <<"first">> -> make_val(LServer, Match, <<"lgiven">>, LVal);
+		   <<"middle">> -> make_val(LServer, Match, <<"lmiddle">>, LVal);
+		   <<"nick">> -> make_val(LServer, Match, <<"lnickname">>, LVal);
+		   <<"bday">> -> make_val(LServer, Match, <<"lbday">>, LVal);
+		   <<"ctry">> -> make_val(LServer, Match, <<"lctry">>, LVal);
 		   <<"locality">> ->
-		       make_val(Match, <<"llocality">>, LVal);
-		   <<"email">> -> make_val(Match, <<"lemail">>, LVal);
-		   <<"orgname">> -> make_val(Match, <<"lorgname">>, LVal);
-		   <<"orgunit">> -> make_val(Match, <<"lorgunit">>, LVal);
+		       make_val(LServer, Match, <<"llocality">>, LVal);
+		   <<"email">> -> make_val(LServer, Match, <<"lemail">>, LVal);
+		   <<"orgname">> -> make_val(LServer, Match, <<"lorgname">>, LVal);
+		   <<"orgunit">> -> make_val(LServer, Match, <<"lorgunit">>, LVal);
 		   _ -> Match
 	       end,
     filter_fields(Ds, NewMatch, LServer);
 filter_fields([_ | Ds], Match, LServer) ->
     filter_fields(Ds, Match, LServer).
 
-make_val(Match, Field, Val) ->
+make_val(LServer, Match, Field, Val) ->
     Condition = case str:suffix(<<"*">>, Val) of
 		  true ->
 		      Val1 = str:substr(Val, 1, byte_size(Val) - 1),
@@ -308,8 +308,9 @@ make_val(Match, Field, Val) ->
 			       "%">>,
 		      [Field, <<" LIKE '">>, SVal, <<"' ESCAPE '^'">>];
 		  _ ->
-		      SVal = ejabberd_sql:escape(Val),
-		      [Field, <<" = '">>, SVal, <<"'">>]
+                      SQLType = ejabberd_option:sql_type(LServer),
+		      SVal = ejabberd_sql:to_string_literal(SQLType, Val),
+		      [Field, <<" = ">>, SVal]
 		end,
     case Match of
       <<"">> -> Condition;

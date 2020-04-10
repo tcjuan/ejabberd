@@ -5,7 +5,7 @@
 %%% Created :  4 Jul 2013 by Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2013-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2013-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -32,7 +32,7 @@
 -behaviour(gen_mod).
 
 %% API
--export([start/2, stop/1, reload/3, depends/2]).
+-export([start/2, stop/1, reload/3, depends/2, mod_doc/0]).
 
 -export([sm_receive_packet/1, user_receive_packet/1, user_send_packet/1,
 	 user_send_packet_strip_tag/1, process_iq_v0_2/1, process_iq_v0_3/1,
@@ -40,18 +40,22 @@
 	 muc_process_iq/2, muc_filter_message/3, message_is_archived/3,
 	 delete_old_messages/2, get_commands_spec/0, msg_to_el/4,
 	 get_room_config/4, set_room_option/3, offline_message/1, export/1,
-	 mod_options/1, remove_mam_for_user_with_peer/3, remove_mam_for_user/2]).
+	 mod_options/1, remove_mam_for_user_with_peer/3, remove_mam_for_user/2,
+	 is_empty_for_user/2, is_empty_for_room/3, check_create_room/4,
+	 process_iq/3, store_mam_message/7, make_id/0, wrap_as_mucsub/2, select/7]).
 
 -include("xmpp.hrl").
 -include("logger.hrl").
 -include("mod_muc_room.hrl").
 -include("ejabberd_commands.hrl").
 -include("mod_mam.hrl").
+-include("translate.hrl").
 
 -define(DEF_PAGE_SIZE, 50).
 -define(MAX_PAGE_SIZE, 250).
 
 -type c2s_state() :: ejabberd_c2s:state().
+-type count() :: non_neg_integer() | undefined.
 
 -callback init(binary(), gen_mod:opts()) -> any().
 -callback remove_user(binary(), binary()) -> any().
@@ -63,23 +67,35 @@
 -callback store(xmlel(), binary(), {binary(), binary()}, chat | groupchat,
 		jid(), binary(), recv | send, integer()) -> ok | any().
 -callback write_prefs(binary(), binary(), #archive_prefs{}, binary()) -> ok | any().
--callback get_prefs(binary(), binary()) -> {ok, #archive_prefs{}} | error.
+-callback get_prefs(binary(), binary()) -> {ok, #archive_prefs{}} | error | {error, db_failure}.
 -callback select(binary(), jid(), jid(), mam_query:result(),
 		 #rsm_set{} | undefined, chat | groupchat) ->
-    {[{binary(), non_neg_integer(), xmlel()}], boolean(), non_neg_integer()}.
+    {[{binary(), non_neg_integer(), xmlel()}], boolean(), count()} |
+    {error, db_failure}.
+-callback select(binary(), jid(), jid(), mam_query:result(),
+		 #rsm_set{} | undefined, chat | groupchat,
+		 all | only_count | only_messages) ->
+		    {[{binary(), non_neg_integer(), xmlel()}], boolean(), count()} |
+		    {error, db_failure}.
 -callback use_cache(binary()) -> boolean().
 -callback cache_nodes(binary()) -> [node()].
 -callback remove_from_archive(binary(), binary(), jid() | none) -> ok | {error, any()}.
+-callback is_empty_for_user(binary(), binary()) -> boolean().
+-callback is_empty_for_room(binary(), binary(), binary()) -> boolean().
+-callback select_with_mucsub(binary(), jid(), jid(), mam_query:result(),
+			     #rsm_set{} | undefined, all | only_count | only_messages) ->
+    {[{binary(), non_neg_integer(), xmlel()}], boolean(), count()} |
+    {error, db_failure}.
 
--optional_callbacks([use_cache/1, cache_nodes/1]).
+-optional_callbacks([use_cache/1, cache_nodes/1, select_with_mucsub/6, select/6, select/7]).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 start(Host, Opts) ->
-    case gen_mod:get_opt(db_type, Opts) of
+    case mod_mam_opt:db_type(Opts) of
 	mnesia ->
-	    ?WARNING_MSG("Mnesia backend for ~s is not recommended: "
+	    ?WARNING_MSG("Mnesia backend for ~ts is not recommended: "
 			 "it's limited to 2GB and often gets corrupted "
 			 "when reaching this limit. SQL backend is "
 			 "recommended. Namely, for small servers SQLite "
@@ -88,48 +104,60 @@ start(Host, Opts) ->
 	_ ->
 	    ok
     end,
-    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
-    Mod:init(Host, Opts),
-    init_cache(Mod, Host, Opts),
-    register_iq_handlers(Host),
-    ejabberd_hooks:add(sm_receive_packet, Host, ?MODULE,
-		       sm_receive_packet, 50),
-    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE,
-		       user_receive_packet, 88),
-    ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
-		       user_send_packet, 88),
-    ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
-		       user_send_packet_strip_tag, 500),
-    ejabberd_hooks:add(offline_message_hook, Host, ?MODULE,
-		       offline_message, 50),
-    ejabberd_hooks:add(muc_filter_message, Host, ?MODULE,
-		       muc_filter_message, 50),
-    ejabberd_hooks:add(muc_process_iq, Host, ?MODULE,
-		       muc_process_iq, 50),
-    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
-		       disco_sm_features, 50),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE,
-		       remove_user, 50),
-    ejabberd_hooks:add(remove_room, Host, ?MODULE,
-		       remove_room, 50),
-    ejabberd_hooks:add(get_room_config, Host, ?MODULE,
-		       get_room_config, 50),
-    ejabberd_hooks:add(set_room_option, Host, ?MODULE,
-		       set_room_option, 50),
-    case gen_mod:get_opt(assume_mam_usage, Opts) of
-	true ->
-	    ejabberd_hooks:add(message_is_archived, Host, ?MODULE,
-			       message_is_archived, 50);
-	false ->
-	    ok
-    end,
-    ejabberd_commands:register_commands(get_commands_spec()),
-    ok.
+    Mod = gen_mod:db_mod(Opts, ?MODULE),
+    case Mod:init(Host, Opts) of
+	ok ->
+	    init_cache(Mod, Host, Opts),
+	    register_iq_handlers(Host),
+	    ejabberd_hooks:add(sm_receive_packet, Host, ?MODULE,
+			       sm_receive_packet, 50),
+	    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE,
+			       user_receive_packet, 88),
+	    ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
+			       user_send_packet, 88),
+	    ejabberd_hooks:add(user_send_packet, Host, ?MODULE,
+			       user_send_packet_strip_tag, 500),
+	    ejabberd_hooks:add(offline_message_hook, Host, ?MODULE,
+			       offline_message, 49),
+	    ejabberd_hooks:add(muc_filter_message, Host, ?MODULE,
+			       muc_filter_message, 50),
+	    ejabberd_hooks:add(muc_process_iq, Host, ?MODULE,
+			       muc_process_iq, 50),
+	    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
+			       disco_sm_features, 50),
+	    ejabberd_hooks:add(remove_user, Host, ?MODULE,
+			       remove_user, 50),
+	    ejabberd_hooks:add(get_room_config, Host, ?MODULE,
+			       get_room_config, 50),
+	    ejabberd_hooks:add(set_room_option, Host, ?MODULE,
+			       set_room_option, 50),
+	    ejabberd_hooks:add(store_mam_message, Host, ?MODULE,
+			       store_mam_message, 100),
+	    case mod_mam_opt:assume_mam_usage(Opts) of
+		true ->
+		    ejabberd_hooks:add(message_is_archived, Host, ?MODULE,
+				       message_is_archived, 50);
+		false ->
+		    ok
+	    end,
+	    case mod_mam_opt:clear_archive_on_room_destroy(Opts) of
+		true ->
+		    ejabberd_hooks:add(remove_room, Host, ?MODULE,
+				       remove_room, 50);
+		false ->
+		    ejabberd_hooks:add(check_create_room, Host, ?MODULE,
+				       check_create_room, 50)
+	    end,
+	    ejabberd_commands:register_commands(get_commands_spec()),
+	    ok;
+	Err ->
+	    Err
+    end.
 
 use_cache(Mod, Host) ->
     case erlang:function_exported(Mod, use_cache, 2) of
 	true -> Mod:use_cache(Host);
-	false -> gen_mod:get_module_opt(Host, ?MODULE, use_cache)
+	false -> mod_mam_opt:use_cache(Host)
     end.
 
 cache_nodes(Mod, Host) ->
@@ -147,12 +175,9 @@ init_cache(Mod, Host, Opts) ->
     end.
 
 cache_opts(Opts) ->
-    MaxSize = gen_mod:get_opt(cache_size, Opts),
-    CacheMissed = gen_mod:get_opt(cache_missed, Opts),
-    LifeTime = case gen_mod:get_opt(cache_life_time, Opts) of
-		   infinity -> infinity;
-		   I -> timer:seconds(I)
-	       end,
+    MaxSize = mod_mam_opt:cache_size(Opts),
+    CacheMissed = mod_mam_opt:cache_missed(Opts),
+    LifeTime = mod_mam_opt:cache_life_time(Opts),
     [{max_size, MaxSize}, {life_time, LifeTime}, {cache_missed, CacheMissed}].
 
 stop(Host) ->
@@ -166,7 +191,7 @@ stop(Host) ->
     ejabberd_hooks:delete(user_send_packet, Host, ?MODULE,
 			  user_send_packet_strip_tag, 500),
     ejabberd_hooks:delete(offline_message_hook, Host, ?MODULE,
-			  offline_message, 50),
+			  offline_message, 49),
     ejabberd_hooks:delete(muc_filter_message, Host, ?MODULE,
 			  muc_filter_message, 50),
     ejabberd_hooks:delete(muc_process_iq, Host, ?MODULE,
@@ -175,18 +200,26 @@ stop(Host) ->
 			  disco_sm_features, 50),
     ejabberd_hooks:delete(remove_user, Host, ?MODULE,
 			  remove_user, 50),
-    ejabberd_hooks:delete(remove_room, Host, ?MODULE,
-			  remove_room, 50),
     ejabberd_hooks:delete(get_room_config, Host, ?MODULE,
 			  get_room_config, 50),
     ejabberd_hooks:delete(set_room_option, Host, ?MODULE,
 			  set_room_option, 50),
-    case gen_mod:get_module_opt(Host, ?MODULE, assume_mam_usage) of
+    ejabberd_hooks:delete(store_mam_message, Host, ?MODULE,
+			  store_mam_message, 100),
+    case mod_mam_opt:assume_mam_usage(Host) of
 	true ->
 	    ejabberd_hooks:delete(message_is_archived, Host, ?MODULE,
 				  message_is_archived, 50);
 	false ->
 	    ok
+    end,
+    case mod_mam_opt:clear_archive_on_room_destroy(Host) of
+	true ->
+	    ejabberd_hooks:delete(remove_room, Host, ?MODULE,
+				  remove_room, 50);
+	false ->
+	    ejabberd_hooks:delete(check_create_room, Host, ?MODULE,
+				  check_create_room, 50)
     end,
     case gen_mod:is_loaded_elsewhere(Host, ?MODULE) of
         false ->
@@ -196,22 +229,23 @@ stop(Host) ->
     end.
 
 reload(Host, NewOpts, OldOpts) ->
-    NewMod = gen_mod:db_mod(Host, NewOpts, ?MODULE),
-    OldMod = gen_mod:db_mod(Host, OldOpts, ?MODULE),
+    NewMod = gen_mod:db_mod(NewOpts, ?MODULE),
+    OldMod = gen_mod:db_mod(OldOpts, ?MODULE),
     if NewMod /= OldMod ->
 	    NewMod:init(Host, NewOpts);
        true ->
 	    ok
     end,
     init_cache(NewMod, Host, NewOpts),
-    case gen_mod:is_equal_opt(assume_mam_usage, NewOpts, OldOpts) of
-	{false, true, _} ->
+    case {mod_mam_opt:assume_mam_usage(NewOpts),
+	  mod_mam_opt:assume_mam_usage(OldOpts)} of
+	{true, false} ->
 	    ejabberd_hooks:add(message_is_archived, Host, ?MODULE,
 			       message_is_archived, 50);
-	{false, false, _} ->
+	{false, true} ->
 	    ejabberd_hooks:delete(message_is_archived, Host, ?MODULE,
 				  message_is_archived, 50);
-	true ->
+	_ ->
 	    ok
     end.
 
@@ -412,6 +446,10 @@ muc_filter_message(#message{from = From} = Pkt,
 muc_filter_message(Acc, _MUCState, _FromNick) ->
     Acc.
 
+-spec make_id() -> integer().
+make_id() ->
+    erlang:system_time(microsecond).
+
 -spec get_stanza_id(stanza()) -> integer().
 get_stanza_id(#message{meta = #{stanza_id := ID}}) ->
     ID.
@@ -422,11 +460,11 @@ init_stanza_id(#message{meta = #{stanza_id := _ID}} = Pkt, _LServer) ->
 init_stanza_id(#message{meta = #{from_offline := true}} = Pkt, _LServer) ->
     Pkt;
 init_stanza_id(Pkt, LServer) ->
-    ID = p1_time_compat:system_time(micro_seconds),
+    ID = make_id(),
     Pkt1 = strip_my_stanza_id(Pkt, LServer),
     xmpp:put_meta(Pkt1, stanza_id, ID).
 
--spec set_stanza_id(stanza(), jid(), integer()) -> stanza().
+-spec set_stanza_id(stanza(), jid(), binary()) -> stanza().
 set_stanza_id(Pkt, JID, ID) ->
     BareJID = jid:remove_resource(JID),
     Archived = #mam_archived{by = BareJID, id = ID},
@@ -472,7 +510,7 @@ muc_process_iq(#iq{type = T, lang = Lang,
 	    Role = mod_muc_room:get_role(From, MUCState),
 	    process_iq(LServer, IQ, {groupchat, Role, MUCState});
 	false ->
-	    Text = <<"Only members may query archives of this room">>,
+	    Text = ?T("Only members may query archives of this room"),
 	    xmpp:make_error(IQ, xmpp:err_forbidden(Text, Lang))
     end;
 muc_process_iq(#iq{type = get,
@@ -516,7 +554,7 @@ disco_sm_features(Acc, _From, _To, _Node, _Lang) ->
 message_is_archived(true, _C2SState, _Pkt) ->
     true;
 message_is_archived(false, #{lserver := LServer}, Pkt) ->
-    case gen_mod:get_module_opt(LServer, ?MODULE, assume_mam_usage) of
+    case mod_mam_opt:assume_mam_usage(LServer) of
 	true ->
 	    is_archived(Pkt, LServer);
 	false ->
@@ -526,18 +564,18 @@ message_is_archived(false, #{lserver := LServer}, Pkt) ->
 delete_old_messages(TypeBin, Days) when TypeBin == <<"chat">>;
 					TypeBin == <<"groupchat">>;
 					TypeBin == <<"all">> ->
-    CurrentTime = p1_time_compat:system_time(micro_seconds),
+    CurrentTime = make_id(),
     Diff = Days * 24 * 60 * 60 * 1000000,
     TimeStamp = misc:usec_to_now(CurrentTime - Diff),
     Type = misc:binary_to_atom(TypeBin),
     DBTypes = lists:usort(
 		lists:map(
 		  fun(Host) ->
-			  case gen_mod:get_module_opt(Host, ?MODULE, db_type) of
+			  case mod_mam_opt:db_type(Host) of
 			      sql -> {sql, Host};
 			      Other -> {Other, global}
 			  end
-		  end, ejabberd_config:get_myhosts())),
+		  end, ejabberd_option:hosts())),
     Results = lists:map(
 		fun({DBType, ServerHost}) ->
 			Mod = gen_mod:db_mod(DBType, ?MODULE),
@@ -553,6 +591,24 @@ delete_old_messages(_TypeBin, _Days) ->
 export(LServer) ->
     Mod = gen_mod:db_mod(LServer, ?MODULE),
     Mod:export(LServer).
+
+-spec is_empty_for_user(binary(), binary()) -> boolean().
+is_empty_for_user(User, Server) ->
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    Mod:is_empty_for_user(LUser, LServer).
+
+-spec is_empty_for_room(binary(), binary(), binary()) -> boolean().
+is_empty_for_room(LServer, Name, Host) ->
+    LName = jid:nodeprep(Name),
+    LHost = jid:nameprep(Host),
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    Mod:is_empty_for_room(LServer, LName, LHost).
+
+-spec check_create_room(boolean(), binary(), binary(), binary()) -> boolean().
+check_create_room(Acc, ServerHost, RoomID, Host) ->
+    Acc and is_empty_for_room(ServerHost, RoomID, Host).
 
 %%%===================================================================
 %%% Internal functions
@@ -583,48 +639,66 @@ process_iq(#iq{from = #jid{luser = LUser, lserver = LServer},
 				     default = Default,
 				     always = Always0,
 				     never = Never0}]} = IQ) ->
-    Always = lists:usort(get_jids(Always0)),
-    Never = lists:usort(get_jids(Never0)),
-    case write_prefs(LUser, LServer, LServer, Default, Always, Never) of
-	ok ->
-	    NewPrefs = prefs_el(Default, Always, Never, NS),
-	    xmpp:make_iq_result(IQ, NewPrefs);
-	_Err ->
-	    Txt = <<"Database failure">>,
-	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
+    Access = mod_mam_opt:access_preferences(LServer),
+    case acl:match_rule(LServer, Access, jid:make(LUser, LServer)) of
+	allow ->
+	    Always = lists:usort(get_jids(Always0)),
+	    Never = lists:usort(get_jids(Never0)),
+	    case write_prefs(LUser, LServer, LServer, Default, Always, Never) of
+		ok ->
+		    NewPrefs = prefs_el(Default, Always, Never, NS),
+		    xmpp:make_iq_result(IQ, NewPrefs);
+		_Err ->
+		    Txt = ?T("Database failure"),
+		    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
+	    end;
+	deny ->
+	    Txt = ?T("MAM preference modification denied by service policy"),
+	    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang))
     end;
 process_iq(#iq{from = #jid{luser = LUser, lserver = LServer},
-	       to = #jid{lserver = LServer},
+	       to = #jid{lserver = LServer}, lang = Lang,
 	       type = get, sub_els = [#mam_prefs{xmlns = NS}]} = IQ) ->
-    Prefs = get_prefs(LUser, LServer),
-    PrefsEl = prefs_el(Prefs#archive_prefs.default,
-		       Prefs#archive_prefs.always,
-		       Prefs#archive_prefs.never,
-		       NS),
-    xmpp:make_iq_result(IQ, PrefsEl);
+    case get_prefs(LUser, LServer) of
+	{ok, Prefs} ->
+	    PrefsEl = prefs_el(Prefs#archive_prefs.default,
+			       Prefs#archive_prefs.always,
+			       Prefs#archive_prefs.never,
+			       NS),
+	    xmpp:make_iq_result(IQ, PrefsEl);
+	{error, _} ->
+	    Txt = ?T("Database failure"),
+	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
+    end;
 process_iq(IQ) ->
     xmpp:make_error(IQ, xmpp:err_not_allowed()).
 
 process_iq(LServer, #iq{from = #jid{luser = LUser}, lang = Lang,
 			sub_els = [SubEl]} = IQ, MsgType) ->
-    case MsgType of
-	chat ->
-	    maybe_activate_mam(LUser, LServer);
-	{groupchat, _Role, _MUCState} ->
-	    ok
-    end,
-    case SubEl of
-	#mam_query{rsm = #rsm_set{index = I}} when is_integer(I) ->
-	    Txt = <<"Unsupported <index/> element">>,
-	    xmpp:make_error(IQ, xmpp:err_feature_not_implemented(Txt, Lang));
-	#mam_query{rsm = RSM, xmlns = NS} ->
-	    case parse_query(SubEl, Lang) of
-		{ok, Query} ->
-		    NewRSM = limit_max(RSM, NS),
-		    select_and_send(LServer, Query, NewRSM, IQ, MsgType);
-		{error, Err} ->
-		    xmpp:make_error(IQ, Err)
-	    end
+    Ret = case MsgType of
+	      chat ->
+		  maybe_activate_mam(LUser, LServer);
+	      _ ->
+		  ok
+	  end,
+    case Ret of
+	ok ->
+	    case SubEl of
+		#mam_query{rsm = #rsm_set{index = I}} when is_integer(I) ->
+		    Txt = ?T("Unsupported <index/> element"),
+		    xmpp:make_error(IQ, xmpp:err_feature_not_implemented(Txt, Lang));
+		#mam_query{rsm = RSM, xmlns = NS} ->
+		    case parse_query(SubEl, Lang) of
+			{ok, Query} ->
+			    NewRSM = limit_max(RSM, NS),
+			    select_and_send(LServer, Query, NewRSM, IQ, MsgType);
+			{error, Err} ->
+			    xmpp:make_error(IQ, Err)
+		    end
+	    end;
+	{error, _} ->
+	     Txt = ?T("Database failure"),
+	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
     end.
 
 -spec should_archive(message(), binary()) -> boolean().
@@ -818,23 +892,25 @@ may_enter_room(From, MUCState) ->
 -spec store_msg(message(), binary(), binary(), jid(), send | recv)
       -> ok | pass | any().
 store_msg(Pkt, LUser, LServer, Peer, Dir) ->
-    Prefs = get_prefs(LUser, LServer),
-    case {should_archive_peer(LUser, LServer, Prefs, Peer), Pkt} of
-	{true, #message{meta = #{sm_copy := true}}} ->
-	    ok; % Already stored.
-	{true, _} ->
-	    case ejabberd_hooks:run_fold(store_mam_message, LServer, Pkt,
-					 [LUser, LServer, Peer, chat, Dir]) of
-		drop ->
-		    pass;
-		Pkt1 ->
-		    US = {LUser, LServer},
-		    ID = get_stanza_id(Pkt1),
-		    El = xmpp:encode(Pkt1),
-		    Mod = gen_mod:db_mod(LServer, ?MODULE),
-		    Mod:store(El, LServer, US, chat, Peer, <<"">>, Dir, ID)
+    case get_prefs(LUser, LServer) of
+	{ok, Prefs} ->
+	    UseMucArchive = mod_mam_opt:user_mucsub_from_muc_archive(LServer),
+	    StoredInMucMam = UseMucArchive andalso xmpp:get_meta(Pkt, in_muc_mam, false),
+	    case {should_archive_peer(LUser, LServer, Prefs, Peer), Pkt, StoredInMucMam} of
+		{true, #message{meta = #{sm_copy := true}}, _} ->
+		    ok; % Already stored.
+		{true, _, true} ->
+		    ok; % Stored in muc archive.
+		{true, _, _} ->
+		    case ejabberd_hooks:run_fold(store_mam_message, LServer, Pkt,
+						 [LUser, LServer, Peer, <<"">>, chat, Dir]) of
+			#message{} -> ok;
+			_ -> pass
+		    end;
+		{false, _, _} ->
+		    pass
 	    end;
-	{false, _} ->
+	{error, _} ->
 	    pass
     end.
 
@@ -846,19 +922,22 @@ store_muc(MUCState, Pkt, RoomJID, Peer, Nick) ->
 	    {U, S, _} = jid:tolower(RoomJID),
 	    LServer = MUCState#state.server_host,
 	    case ejabberd_hooks:run_fold(store_mam_message, LServer, Pkt,
-					 [U, S, Peer, groupchat, recv]) of
-		drop ->
-		    pass;
-		Pkt1 ->
-		    US = {U, S},
-		    ID = get_stanza_id(Pkt1),
-		    El = xmpp:encode(Pkt1),
-		    Mod = gen_mod:db_mod(LServer, ?MODULE),
-		    Mod:store(El, LServer, US, groupchat, Peer, Nick, recv, ID)
+					 [U, S, Peer, Nick, groupchat, recv]) of
+		#message{} -> ok;
+		_ -> pass
 	    end;
 	false ->
 	    pass
     end.
+
+store_mam_message(Pkt, U, S, Peer, Nick, Type, Dir) ->
+    LServer = ejabberd_router:host_of_route(S),
+    US = {U, S},
+    ID = get_stanza_id(Pkt),
+    El = xmpp:encode(Pkt),
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    Mod:store(El, LServer, US, Type, Peer, Nick, Dir, ID),
+    Pkt.
 
 write_prefs(LUser, LServer, Host, Default, Always, Never) ->
     Prefs = #archive_prefs{us = {LUser, LServer},
@@ -890,18 +969,17 @@ get_prefs(LUser, LServer) ->
 	  end,
     case Res of
 	{ok, Prefs} ->
-	    Prefs;
+	    {ok, Prefs};
+	{error, _} ->
+	    {error, db_failure};
 	error ->
-	    ActivateOpt = gen_mod:get_module_opt(
-			    LServer, ?MODULE,
-			    request_activates_archiving),
+	    ActivateOpt = mod_mam_opt:request_activates_archiving(LServer),
 	    case ActivateOpt of
 		true ->
-		    #archive_prefs{us = {LUser, LServer}, default = never};
+		    {ok, #archive_prefs{us = {LUser, LServer}, default = never}};
 		false ->
-		    Default = gen_mod:get_module_opt(
-				LServer, ?MODULE, default),
-		    #archive_prefs{us = {LUser, LServer}, default = Default}
+		    Default = mod_mam_opt:default(LServer),
+		    {ok, #archive_prefs{us = {LUser, LServer}, default = Default}}
 	    end
     end.
 
@@ -912,8 +990,7 @@ prefs_el(Default, Always, Never, NS) ->
 	       xmlns = NS}.
 
 maybe_activate_mam(LUser, LServer) ->
-    ActivateOpt = gen_mod:get_module_opt(
-		    LServer, ?MODULE, request_activates_archiving),
+    ActivateOpt = mod_mam_opt:request_activates_archiving(LServer),
     case ActivateOpt of
 	true ->
 	    Mod = gen_mod:db_mod(LServer, ?MODULE),
@@ -930,9 +1007,10 @@ maybe_activate_mam(LUser, LServer) ->
 	    case Res of
 		{ok, _Prefs} ->
 		    ok;
+		{error, _} ->
+		    {error, db_failure};
 		error ->
-		    Default = gen_mod:get_module_opt(
-				LServer, ?MODULE, default),
+		    Default = mod_mam_opt:default(LServer),
 		    write_prefs(LUser, LServer, LServer, Default, [], [])
 	    end;
 	false ->
@@ -940,19 +1018,28 @@ maybe_activate_mam(LUser, LServer) ->
     end.
 
 select_and_send(LServer, Query, RSM, #iq{from = From, to = To} = IQ, MsgType) ->
-    {Msgs, IsComplete, Count} =
-	case MsgType of
-	    chat ->
-		select(LServer, From, From, Query, RSM, MsgType);
-	    {groupchat, _Role, _MUCState} ->
-		select(LServer, From, To, Query, RSM, MsgType)
-	end,
-    SortedMsgs = lists:keysort(2, Msgs),
-    send(SortedMsgs, Count, IsComplete, IQ).
+    Ret = case MsgType of
+	      chat ->
+		  select(LServer, From, From, Query, RSM, MsgType);
+	      _ ->
+		  select(LServer, From, To, Query, RSM, MsgType)
+	  end,
+    case Ret of
+	{Msgs, IsComplete, Count} ->
+	    SortedMsgs = lists:keysort(2, Msgs),
+	    send(SortedMsgs, Count, IsComplete, IQ);
+	{error, _} ->
+	    Txt = ?T("Database failure"),
+	    Err = xmpp:err_internal_server_error(Txt, IQ#iq.lang),
+	    xmpp:make_error(IQ, Err)
+    end.
+
+select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType) ->
+    select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType, all).
 
 select(_LServer, JidRequestor, JidArchive, Query, RSM,
        {groupchat, _Role, #state{config = #config{mam = false},
-				 history = History}} = MsgType) ->
+				 history = History}} = MsgType, _Flags) ->
     Start = proplists:get_value(start, Query),
     End = proplists:get_value('end', Query),
     #lqueue{queue = Q} = History,
@@ -991,29 +1078,162 @@ select(_LServer, JidRequestor, JidArchive, Query, RSM,
 	_ ->
 	    {Msgs, true, L}
     end;
-select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType) ->
+select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType, Flags) ->
     case might_expose_jid(Query, MsgType) of
 	true ->
 	    {[], true, 0};
 	false ->
-	    Mod = gen_mod:db_mod(LServer, ?MODULE),
-	    Mod:select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType)
+	    case {MsgType, mod_mam_opt:user_mucsub_from_muc_archive(LServer)} of
+		{chat, true} ->
+		    select_with_mucsub(LServer, JidRequestor, JidArchive, Query, RSM, Flags);
+		_ ->
+		    db_select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType, Flags)
+	    end
     end.
+
+select_with_mucsub(LServer, JidRequestor, JidArchive, Query, RSM, Flags) ->
+    MucHosts = mod_muc_admin:find_hosts(LServer),
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    case proplists:get_value(with, Query) of
+	#jid{lserver = WithLServer} = MucJid ->
+	    case lists:member(WithLServer, MucHosts) of
+		true ->
+		    select(LServer, JidRequestor, MucJid, Query, RSM,
+			   {groupchat, member, #state{config = #config{mam = true}}});
+		_ ->
+		    db_select(LServer, JidRequestor, JidArchive, Query, RSM, chat, Flags)
+	    end;
+	_ ->
+	    case erlang:function_exported(Mod, select_with_mucsub, 6) of
+		true ->
+		    Mod:select_with_mucsub(LServer, JidRequestor, JidArchive, Query, RSM, Flags);
+		false ->
+		    select_with_mucsub_fallback(LServer, JidRequestor, JidArchive, Query, RSM, Flags)
+	    end
+    end.
+
+select_with_mucsub_fallback(LServer, JidRequestor, JidArchive, Query, RSM, Flags) ->
+    case db_select(LServer, JidRequestor, JidArchive, Query, RSM, chat, Flags) of
+	{error, _} = Err ->
+	    Err;
+	{Entries, All, Count} ->
+	    {Dir, Max} = case RSM of
+			     #rsm_set{max = M, before = V} when is_binary(V) ->
+				 {desc, M};
+			     #rsm_set{max = M} ->
+				 {asc, M};
+			     _ ->
+				 {asc, undefined}
+			 end,
+	    SubRooms = case mod_muc_admin:find_hosts(LServer) of
+			   [First|_] ->
+			       case mod_muc:get_subscribed_rooms(First, JidRequestor) of
+				   {ok, L} -> L;
+				   {error, _} -> []
+			       end;
+			   _ ->
+			       []
+		       end,
+	    SubRoomJids = [Jid || {Jid, _} <- SubRooms],
+	    {E2, A2, C2} =
+		lists:foldl(
+		  fun(MucJid, {E0, A0, C0}) ->
+			  case select(LServer, JidRequestor, MucJid, Query, RSM,
+				      {groupchat, member, #state{config = #config{mam = true}}}) of
+			      {error, _} ->
+				  {E0, A0, C0};
+			      {E, A, C} ->
+				  {lists:keymerge(2, E0, wrap_as_mucsub(E, JidRequestor)),
+				   A0 andalso A, C0 + C}
+			  end
+		  end, {Entries, All, Count}, SubRoomJids),
+	    case {Dir, Max} of
+		{_, undefined} ->
+		    {E2, A2, C2};
+		{desc, _} ->
+		    Start = case length(E2) of
+				Len when Len < Max -> 1;
+				Len -> Len - Max + 1
+			    end,
+		    Sub = lists:sublist(E2, Start, Max),
+		    {Sub, if Sub == E2 -> A2; true -> false end, C2};
+		_ ->
+		    Sub = lists:sublist(E2, 1, Max),
+		    {Sub, if Sub == E2 -> A2; true -> false end, C2}
+	    end
+    end.
+
+db_select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType, Flags) ->
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    case erlang:function_exported(Mod, select, 7) of
+	true ->
+	    Mod:select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType, Flags);
+	_ ->
+	Mod:select(LServer, JidRequestor, JidArchive, Query, RSM, MsgType)
+    end.
+
+wrap_as_mucsub(Messages, #jid{lserver = LServer} = Requester) ->
+    ReqBare = jid:remove_resource(Requester),
+    ReqServer = jid:make(<<>>, LServer, <<>>),
+    [{T1, T2, wrap_as_mucsub(M, ReqBare, ReqServer)} || {T1, T2, M} <- Messages].
+
+wrap_as_mucsub(Message, Requester, ReqServer) ->
+    case Message of
+	#forwarded{delay = #delay{stamp = Stamp, desc = Desc},
+		   sub_els = [#message{from = From, sub_els = SubEls, subject = Subject} = Msg]} ->
+	    {L1, SubEls2} = case lists:keytake(mam_archived, 1, SubEls) of
+				{value, Arch, Rest} ->
+				    {[Arch#mam_archived{by = Requester}], Rest};
+				_ ->
+				    {[], SubEls}
+			    end,
+	    {Sid, L2, SubEls3} = case lists:keytake(stanza_id, 1, SubEls2) of
+				{value, #stanza_id{id = Sid0} = SID, Rest2} ->
+				    {Sid0, [SID#stanza_id{by = Requester} | L1], Rest2};
+				_ ->
+				    {p1_rand:get_string(), L1, SubEls2}
+			    end,
+	    Msg2 = Msg#message{to = Requester, sub_els = SubEls3},
+	    Node = case Subject of
+		       [] ->
+			   ?NS_MUCSUB_NODES_MESSAGES;
+		       _ ->
+			   ?NS_MUCSUB_NODES_SUBJECT
+		   end,
+	    #forwarded{delay = #delay{stamp = Stamp, desc = Desc, from = ReqServer},
+		       sub_els = [
+			   #message{from = jid:remove_resource(From), to = Requester,
+				    id = Sid,
+				    sub_els = [#ps_event{
+					items = #ps_items{
+					    node = Node,
+					    items = [#ps_item{
+						id = Sid,
+						sub_els = [Msg2]
+					    }]}} | L2]}]};
+	_ ->
+	    Message
+    end.
+
 
 msg_to_el(#archive_msg{timestamp = TS, packet = El, nick = Nick,
 		       peer = Peer, id = ID},
 	  MsgType, JidRequestor, #jid{lserver = LServer} = JidArchive) ->
-    CodecOpts = ejabberd_config:codec_options(LServer),
+    CodecOpts = ejabberd_config:codec_options(),
     try xmpp:decode(El, ?NS_CLIENT, CodecOpts) of
 	Pkt1 ->
-	    Pkt2 = set_stanza_id(Pkt1, JidArchive, ID),
+	    Pkt2 = case MsgType of
+		       chat -> set_stanza_id(Pkt1, JidArchive, ID);
+		       {groupchat, _, _} -> set_stanza_id(Pkt1, JidArchive, ID);
+		       _ -> Pkt1
+		   end,
 	    Pkt3 = maybe_update_from_to(
 		     Pkt2, JidRequestor, JidArchive, Peer, MsgType, Nick),
 	    Delay = #delay{stamp = TS, from = jid:make(LServer)},
 	    {ok, #forwarded{sub_els = [Pkt3], delay = Delay}}
     catch _:{xmpp_codec, Why} ->
 	    ?ERROR_MSG("Failed to decode raw element ~p from message "
-		       "archive of user ~s: ~s",
+		       "archive of user ~ts: ~ts",
 		       [El, jid:encode(JidArchive), xmpp:format_error(Why)]),
 	    {error, invalid_xml}
     end.
@@ -1041,11 +1261,11 @@ maybe_update_from_to(#message{sub_els = Els} = Pkt, JidRequestor, JidArchive,
     Pkt#message{from = jid:replace_resource(JidArchive, Nick),
 		to = undefined,
 		sub_els = Items ++ Els};
-maybe_update_from_to(Pkt, _JidRequestor, _JidArchive, _Peer, chat, _Nick) ->
+maybe_update_from_to(Pkt, _JidRequestor, _JidArchive, _Peer, _MsgType, _Nick) ->
     Pkt.
 
 -spec send([{binary(), integer(), xmlel()}],
-	   non_neg_integer(), boolean(), iq()) -> iq() | ignore.
+	   count(), boolean(), iq()) -> iq() | ignore.
 send(Msgs, Count, IsComplete,
      #iq{from = From, to = To,
 	 sub_els = [#mam_query{id = QID, xmlns = NS}]} = IQ) ->
@@ -1083,7 +1303,7 @@ send(Msgs, Count, IsComplete,
 	    ignore
     end.
 
--spec make_rsm_out([{binary(), integer(), xmlel()}], non_neg_integer()) -> rsm_set().
+-spec make_rsm_out([{binary(), integer(), xmlel()}], count()) -> rsm_set().
 make_rsm_out([], Count) ->
     #rsm_set{count = Count};
 make_rsm_out([{FirstID, _, _}|_] = Msgs, Count) ->
@@ -1149,7 +1369,8 @@ get_commands_spec() ->
      #ejabberd_commands{name = remove_mam_for_user, tags = [mam],
 			desc = "Remove mam archive for user",
 			module = ?MODULE, function = remove_mam_for_user,
-			args = [{user, binary}, {server, binary}],
+			args = [{user, binary}, {host, binary}],
+			args_rename = [{server, host}],
 			args_desc = ["Username", "Server"],
 			args_example = [<<"bob">>, <<"example.com">>],
 			result = {res, restuple},
@@ -1158,7 +1379,8 @@ get_commands_spec() ->
      #ejabberd_commands{name = remove_mam_for_user_with_peer, tags = [mam],
 			desc = "Remove mam archive for user with peer",
 			module = ?MODULE, function = remove_mam_for_user_with_peer,
-			args = [{user, binary}, {server, binary}, {with, binary}],
+			args = [{user, binary}, {host, binary}, {with, binary}],
+			args_rename = [{server, host}],
 			args_desc = ["Username", "Server", "Peer"],
 			args_example = [<<"bob">>, <<"example.com">>, <<"anne@example.com">>],
 			result = {res, restuple},
@@ -1166,29 +1388,115 @@ get_commands_spec() ->
 			result_example = {ok, <<"MAM archive removed">>}}
 	].
 
+mod_opt_type(compress_xml) ->
+    econf:bool();
 mod_opt_type(assume_mam_usage) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(O) when O == cache_life_time; O == cache_size ->
-    fun (I) when is_integer(I), I > 0 -> I;
-	(infinity) -> infinity
-    end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
+    econf:bool();
 mod_opt_type(default) ->
-    fun (always) -> always;
-	(never) -> never;
-	(roster) -> roster
-    end;
+    econf:enum([always, never, roster]);
 mod_opt_type(request_activates_archiving) ->
-    fun (B) when is_boolean(B) -> B end.
+    econf:bool();
+mod_opt_type(clear_archive_on_room_destroy) ->
+    econf:bool();
+mod_opt_type(user_mucsub_from_muc_archive) ->
+    econf:bool();
+mod_opt_type(access_preferences) ->
+    econf:acl();
+mod_opt_type(db_type) ->
+    econf:db_type(?MODULE);
+mod_opt_type(use_cache) ->
+    econf:bool();
+mod_opt_type(cache_size) ->
+    econf:pos_int(infinity);
+mod_opt_type(cache_missed) ->
+    econf:bool();
+mod_opt_type(cache_life_time) ->
+    econf:timeout(second, infinity).
 
 mod_options(Host) ->
     [{assume_mam_usage, false},
      {default, never},
      {request_activates_archiving, false},
+     {compress_xml, false},
+     {clear_archive_on_room_destroy, true},
+     {access_preferences, all},
+     {user_mucsub_from_muc_archive, false},
      {db_type, ejabberd_config:default_db(Host, ?MODULE)},
-     {use_cache, ejabberd_config:use_cache(Host)},
-     {cache_size, ejabberd_config:cache_size(Host)},
-     {cache_missed, ejabberd_config:cache_missed(Host)},
-     {cache_life_time, ejabberd_config:cache_life_time(Host)}].
+     {use_cache, ejabberd_option:use_cache(Host)},
+     {cache_size, ejabberd_option:cache_size(Host)},
+     {cache_missed, ejabberd_option:cache_missed(Host)},
+     {cache_life_time, ejabberd_option:cache_life_time(Host)}].
+
+mod_doc() ->
+    #{desc =>
+          ?T("This module implements "
+             "https://xmpp.org/extensions/xep-0313.html"
+             "[XEP-0313: Message Archive Management]. "
+             "Compatible XMPP clients can use it to store their "
+             "chat history on the server."),
+      opts =>
+          [{assume_mam_usage,
+            #{value => "true | false",
+              desc =>
+                  ?T("This option determines how ejabberd's "
+                     "stream management code (see 'mod_stream_mgmt') "
+                     "handles unacknowledged messages when the "
+                     "connection is lost. Usually, such messages are "
+                     "either bounced or resent. However, neither is "
+                     "done for messages that were stored in the user's "
+                     "MAM archive if this option is set to 'true'. In "
+                     "this case, ejabberd assumes those messages will "
+                     "be retrieved from the archive. "
+                     "The default value is 'false'.")}},
+           {default,
+            #{value => "always | never | roster",
+              desc =>
+                  ?T("The option defines default policy for chat history. "
+                     "When 'always' is set every chat message is stored. "
+                     "With 'roster' only chat history with contacts from "
+                     "user's roster is stored. And 'never' fully disables "
+                     "chat history. Note that a client can change its "
+                     "policy via protocol commands. "
+                     "The default value is 'never'.")}},
+           {request_activates_archiving,
+            #{value => "true | false",
+              desc =>
+                  ?T("If the value is 'true', no messages are stored "
+                     "for a user until their client issue a MAM request, "
+                     "regardless of the value of the 'default' option. "
+                     "Once the server received a request, that user's "
+                     "messages are archived as usual. "
+                     "The default value is 'false'.")}},
+           {compress_xml,
+            #{value => "true | false",
+              desc =>
+                  ?T("When enabled, new messages added to archives are "
+                     "compressed using a custom compression algorithm. "
+                     "This feature works only with SQL backends. "
+                     "The default value is 'false'.")}},
+           {clear_archive_on_room_destroy,
+            #{value => "true | false",
+              desc =>
+                  ?T("Whether to destroy message archive of a room "
+                     "(see 'mod_muc') when it gets destroyed. "
+                     "The default value is 'true'.")}},
+           {db_type,
+            #{value => "mnesia | sql",
+              desc =>
+                  ?T("Same as top-level 'default_db' option, but applied to this module only.")}},
+           {use_cache,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level 'use_cache' option, but applied to this module only.")}},
+           {cache_size,
+            #{value => "pos_integer() | infinity",
+              desc =>
+                  ?T("Same as top-level 'cache_size' option, but applied to this module only.")}},
+           {cache_missed,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level 'cache_missed' option, but applied to this module only.")}},
+           {cache_life_time,
+            #{value => "timeout()",
+              desc =>
+                  ?T("Same as top-level 'cache_life_time' option, but applied to this module only.")}}]}.

@@ -5,7 +5,7 @@
 %%% Created : 09-10-2010 by Eric Cestari <ecestari@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,6 @@
 %%%----------------------------------------------------------------------
 -module(ejabberd_http_ws).
 -author('ecestari@process-one.net').
--behaviour(ejabberd_config).
 -behaviour(xmpp_socket).
 -behaviour(p1_fsm).
 
@@ -33,7 +32,7 @@
 	 terminate/3, send_xml/2, setopts/2, sockname/1,
 	 peername/1, controlling_process/2, get_owner/1,
 	 reset_stream/1, close/1, change_shaper/2,
-	 socket_handoff/3, get_transport/1, opt_type/1]).
+	 socket_handoff/3, get_transport/1]).
 
 -include("logger.hrl").
 
@@ -41,15 +40,12 @@
 
 -include("ejabberd_http.hrl").
 
--define(PING_INTERVAL, 60).
--define(WEBSOCKET_TIMEOUT, 300).
-
 -record(state,
         {socket                       :: ws_socket(),
-         ping_interval = ?PING_INTERVAL :: non_neg_integer(),
+         ping_interval                :: non_neg_integer(),
          ping_timer = make_ref()      :: reference(),
          pong_expected = false        :: boolean(),
-         timeout = ?WEBSOCKET_TIMEOUT :: non_neg_integer(),
+         timeout                      :: non_neg_integer(),
          timer = make_ref()           :: reference(),
          input = []                   :: list(),
 	 active = false               :: boolean(),
@@ -108,9 +104,8 @@ close({http_ws, FsmRef, _IP}) ->
 reset_stream({http_ws, _FsmRef, _IP} = Socket) ->
     Socket.
 
-change_shaper({http_ws, _FsmRef, _IP}, _Shaper) ->
-    %% TODO???
-    ok.
+change_shaper({http_ws, FsmRef, _IP}, Shaper) ->
+    p1_fsm:send_all_state_event(FsmRef, {new_shaper, Shaper}).
 
 get_transport(_Socket) ->
     websocket.
@@ -134,16 +129,12 @@ init([{#ws{ip = IP, http_opts = HOpts}, _} = WS]) ->
                                (_) -> false
                             end, HOpts),
     Opts = ejabberd_c2s_config:get_c2s_limits() ++ SOpts,
-    PingInterval = ejabberd_config:get_option(
-                     {websocket_ping_interval, ejabberd_config:get_myname()},
-                     ?PING_INTERVAL) * 1000,
-    WSTimeout = ejabberd_config:get_option(
-                  {websocket_timeout, ejabberd_config:get_myname()},
-                  ?WEBSOCKET_TIMEOUT) * 1000,
+    PingInterval = ejabberd_option:websocket_ping_interval(),
+    WSTimeout = ejabberd_option:websocket_timeout(),
     Socket = {http_ws, self(), IP},
     ?DEBUG("Client connected through websocket ~p",
 	   [Socket]),
-    case ejabberd_c2s:start({?MODULE, Socket}, [{receiver, self()}|Opts]) of
+    case ejabberd_c2s:start(?MODULE, Socket, [{receiver, self()}|Opts]) of
 	{ok, C2SPid} ->
 	    ejabberd_c2s:accept(C2SPid),
 	    Timer = erlang:start_timer(WSTimeout, self(), []),
@@ -169,7 +160,10 @@ handle_event({activate, From}, StateName, State) ->
 		       end, Input),
 		     State#state{active = false, input = []}
 	     end,
-    {next_state, StateName, State1#state{c2s_pid = From}}.
+    {next_state, StateName, State1#state{c2s_pid = From}};
+handle_event({new_shaper, Shaper}, StateName, #state{ws = {_, WsPid}} = StateData) ->
+    WsPid ! {new_shaper, Shaper},
+    {next_state, StateName, StateData}.
 
 handle_sync_event({send_xml, Packet}, _From, StateName,
 		  #state{ws = {_, WsPid}, rfc_compilant = R} = StateData) ->
@@ -202,15 +196,15 @@ handle_sync_event({send_xml, Packet}, _From, StateName,
     case Packet2 of
         {xmlstreamstart, Name, Attrs3} ->
             B = fxml:element_to_binary(#xmlel{name = Name, attrs = Attrs3}),
-            WsPid ! {send, <<(binary:part(B, 0, byte_size(B)-2))/binary, ">">>};
+            route_text(WsPid, <<(binary:part(B, 0, byte_size(B)-2))/binary, ">">>);
         {xmlstreamend, Name} ->
-            WsPid ! {send, <<"</", Name/binary, ">">>};
+            route_text(WsPid, <<"</", Name/binary, ">">>);
         {xmlstreamelement, El} ->
-            WsPid ! {send, fxml:element_to_binary(El)};
+            route_text(WsPid, fxml:element_to_binary(El));
         {xmlstreamraw, Bin} ->
-            WsPid ! {send, Bin};
+            route_text(WsPid, Bin);
         {xmlstreamcdata, Bin2} ->
-            WsPid ! {send, Bin2};
+            route_text(WsPid, Bin2);
         skip ->
             ok
     end,
@@ -225,7 +219,7 @@ handle_sync_event(close, _From, StateName, #state{ws = {_, WsPid}, rfc_compilant
   when StateName /= stream_end_sent ->
     Close = #xmlel{name = <<"close">>,
                    attrs = [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-framing">>}]},
-    WsPid ! {send, fxml:element_to_binary(Close)},
+    route_text(WsPid, fxml:element_to_binary(Close)),
     {stop, normal, StateData};
 handle_sync_event(close, _From, _StateName, StateData) ->
     {stop, normal, StateData}.
@@ -359,6 +353,7 @@ parsed_items(List) ->
           when element(1, El) == xmlel;
                element(1, El) == xmlstreamstart;
                element(1, El) == xmlstreamelement;
+               element(1, El) == xmlstreamcdata;
                element(1, El) == xmlstreamend ->
             parsed_items([El | List]);
         {'$gen_event', {xmlstreamerror, _}} ->
@@ -367,9 +362,7 @@ parsed_items(List) ->
             lists:reverse(List)
     end.
 
-opt_type(websocket_ping_interval) ->
-    fun (I) when is_integer(I), I >= 0 -> I end;
-opt_type(websocket_timeout) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-opt_type(_) ->
-    [websocket_ping_interval, websocket_timeout].
+-spec route_text(pid(), binary()) -> ok.
+route_text(Pid, Data) ->
+    Pid ! {text, Data},
+    ok.

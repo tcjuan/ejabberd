@@ -28,6 +28,9 @@ PACKAGE_TARNAME = @PACKAGE_TARNAME@
 datarootdir = @datarootdir@
 DOCDIR = $(DESTDIR)@docdir@
 
+# /share/doc/man/man5
+MANDIR = $(DESTDIR)@mandir@/man5
+
 # /usr/lib/ejabberd/ebin/
 BEAMDIR = $(EJABBERDDIR)/ebin
 
@@ -119,6 +122,11 @@ update:
 xref: all
 	$(REBAR) skip_deps=true xref
 
+hooks: all
+	tools/hook_deps.sh ebin
+
+options: all
+	tools/opt_types.sh ejabberd_option ebin
 
 translations:
 	tools/prepare-tr.sh
@@ -152,7 +160,7 @@ DEPS_FILES_FILTERED=$(filter-out $(BINARIES) deps/elixir/ebin/elixir.app,$(DEPS_
 DEPS_DIRS=$(sort deps/ $(foreach DEP,$(DEPS),deps/$(DEP)/) $(dir $(DEPS_FILES)))
 
 MAIN_FILES=$(filter-out %/configure.beam,$(call FILES_WILDCARD,ebin/*.beam ebin/*.app priv/msgs/*.msg priv/css/*.css priv/img/*.png priv/js/*.js priv/lib/* include/*.hrl COPYING))
-MAIN_DIRS=$(sort $(dir $(MAIN_FILES)) priv/bin priv/sql)
+MAIN_DIRS=$(sort $(dir $(MAIN_FILES)) priv/bin priv/sql priv/lua)
 
 define DEP_VERSION_template
 DEP_$(1)_VERSION:=$(shell $(SED) -e '/vsn/!d;s/.*, *"/$(1)-/;s/".*//' $(2) 2>/dev/null)
@@ -184,7 +192,10 @@ $(call TO_DEST,priv/sql/lite.sql): sql/lite.sql $(call TO_DEST,priv/sql)
 $(call TO_DEST,priv/bin/captcha.sh): tools/captcha.sh $(call TO_DEST,priv/bin)
 	$(INSTALL) -m 755 $(O_USER) $< $@
 
-copy-files-sub2: $(call TO_DEST,$(DEPS_FILES) $(MAIN_FILES) priv/bin/captcha.sh priv/sql/lite.sql)
+$(call TO_DEST,priv/lua/redis_sm.lua): priv/lua/redis_sm.lua $(call TO_DEST,priv/lua)
+	$(INSTALL) -m 644 $< $@
+
+copy-files-sub2: $(call TO_DEST,$(DEPS_FILES) $(MAIN_FILES) priv/bin/captcha.sh priv/sql/lite.sql priv/lua/redis_sm.lua)
 
 .PHONY: $(call TO_DEST,$(DEPS_FILES) $(MAIN_DIRS) $(DEPS_DIRS))
 
@@ -254,10 +265,11 @@ install: all copy-files
 	chmod -R 750 $(LOGDIR)
 	#
 	# Documentation
+	$(INSTALL) -d $(MANDIR)
 	$(INSTALL) -d $(DOCDIR)
-	[ -f doc/guide.html ] \
-		&& $(INSTALL) -m 644 doc/guide.html $(DOCDIR) \
-		|| echo "Documentation not included in sources"
+	[ -f man/ejabberd.yml.5 ] \
+		&& $(INSTALL) -m 644 man/ejabberd.yml.5 $(MANDIR) \
+		|| echo "Man page not included in sources"
 	$(INSTALL) -m 644 COPYING $(DOCDIR)
 
 uninstall: uninstall-binary
@@ -332,8 +344,8 @@ dialyzer/erlang.plt:
 	@mkdir -p dialyzer
 	@dialyzer --build_plt --output_plt dialyzer/erlang.plt \
 	-o dialyzer/erlang.log --apps kernel stdlib sasl crypto \
-	public_key ssl mnesia inets odbc tools compiler erts \
-	runtime_tools asn1 observer xmerl et gs wx syntax_tools; \
+	public_key ssl mnesia inets odbc compiler erts \
+	os_mon asn1 syntax_tools; \
 	status=$$? ; if [ $$status -ne 2 ]; then exit $$status; else exit 0; fi
 
 dialyzer/deps.plt:
@@ -372,9 +384,6 @@ test:
 	@cd priv && ln -sf ../sql
 	$(REBAR) skip_deps=true ct
 
-quicktest:
-	$(REBAR) skip_deps=true ct suites=elixir
-
 .PHONY: src edoc dialyzer Makefile TAGS clean clean-rel distclean rel \
 	install uninstall uninstall-binary uninstall-all translations deps test \
-	quicktest erlang_plt deps_plt ejabberd_plt
+	quicktest erlang_plt deps_plt ejabberd_plt xref hooks options

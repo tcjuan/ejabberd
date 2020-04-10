@@ -2,7 +2,7 @@
 %%% Created : 12 Dec 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,7 @@
 -behaviour(ejabberd_listener).
 
 %% ejabberd_listener callbacks
--export([start/2, start_link/2, accept/1, listen_opt_type/1, listen_options/0]).
+-export([start/3, start_link/3, accept/1, listen_options/0]).
 %% xmpp_stream_in callbacks
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3]).
@@ -44,18 +44,18 @@
 -include("xmpp.hrl").
 -include("logger.hrl").
 
--type state() :: map().
+-type state() :: xmpp_stream_in:state().
 -export_type([state/0]).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-start(SockData, Opts) ->
-    xmpp_stream_in:start(?MODULE, [SockData, Opts],
+start(SockMod, Socket, Opts) ->
+    xmpp_stream_in:start(?MODULE, [{SockMod, Socket}, Opts],
 			 ejabberd_config:fsm_limit_opts(Opts)).
 
-start_link(SockData, Opts) ->
-    xmpp_stream_in:start_link(?MODULE, [SockData, Opts],
+start_link(SockMod, Socket, Opts) ->
+    xmpp_stream_in:start_link(?MODULE, [{SockMod, Socket}, Opts],
 			      ejabberd_config:fsm_limit_opts(Opts)).
 
 close(Ref) ->
@@ -110,11 +110,11 @@ host_down(Host) ->
 %%% Hooks
 %%%===================================================================
 handle_unexpected_info(State, Info) ->
-    ?WARNING_MSG("got unexpected info: ~p", [Info]),
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     State.
 
 handle_unexpected_cast(State, Msg) ->
-    ?WARNING_MSG("got unexpected cast: ~p", [Msg]),
+    ?WARNING_MSG("Unexpected cast: ~p", [Msg]),
     State.
 
 reject_unauthenticated_packet(State, _Pkt) ->
@@ -128,24 +128,24 @@ process_closed(#{server := LServer} = State, Reason) ->
 		  #{ip := IP} ->
 		      ejabberd_config:may_hide_data(misc:ip_to_list(IP))
 	      end,
-    ?INFO_MSG("Closing inbound s2s connection ~s -> ~s: ~s",
+    ?INFO_MSG("Closing inbound s2s connection ~ts -> ~ts: ~ts",
 	      [RServer, LServer, xmpp_stream_out:format_error(Reason)]),
     stop(State).
 
 %%%===================================================================
 %%% xmpp_stream_in callbacks
 %%%===================================================================
-tls_options(#{tls_options := TLSOpts, server_host := LServer}) ->
-    ejabberd_s2s:tls_options(LServer, TLSOpts).
+tls_options(#{tls_options := TLSOpts, lserver := LServer, server_host := ServerHost}) ->
+    ejabberd_s2s:tls_options(LServer, ServerHost, TLSOpts).
 
-tls_required(#{server_host := LServer}) ->
-    ejabberd_s2s:tls_required(LServer).
+tls_required(#{server_host := ServerHost}) ->
+    ejabberd_s2s:tls_required(ServerHost).
 
-tls_enabled(#{server_host := LServer}) ->
-    ejabberd_s2s:tls_enabled(LServer).
+tls_enabled(#{server_host := ServerHost}) ->
+    ejabberd_s2s:tls_enabled(ServerHost).
 
-compress_methods(#{server_host := LServer}) ->
-    case ejabberd_s2s:zlib_enabled(LServer) of
+compress_methods(#{server_host := ServerHost}) ->
+    case ejabberd_s2s:zlib_enabled(ServerHost) of
 	true -> [<<"zlib">>];
 	false -> []
     end.
@@ -162,13 +162,13 @@ handle_stream_start(_StreamStart, #{lserver := LServer} = State) ->
 	    send(State, xmpp:serr_host_unknown());
 	true ->
 	    ServerHost = ejabberd_router:host_of_route(LServer),
-	    Opts = ejabberd_config:codec_options(LServer),
+	    Opts = ejabberd_config:codec_options(),
 	    State#{server_host => ServerHost, codec_options => Opts}
     end.
 
-handle_stream_end(Reason, #{server_host := LServer} = State) ->
+handle_stream_end(Reason, #{server_host := ServerHost} = State) ->
     State1 = State#{stop_reason => Reason},
-    ejabberd_hooks:run_fold(s2s_in_closed, LServer, State1, [Reason]).
+    ejabberd_hooks:run_fold(s2s_in_closed, ServerHost, State1, [Reason]).
 
 handle_stream_established(State) ->
     set_idle_timeout(State#{established => true}).
@@ -178,7 +178,7 @@ handle_auth_success(RServer, Mech, _AuthModule,
 		      auth_domains := AuthDomains,
 		      server_host := ServerHost,
 		      lserver := LServer} = State) ->
-    ?INFO_MSG("(~s) Accepted inbound s2s ~s authentication ~s -> ~s (~s)",
+    ?INFO_MSG("(~ts) Accepted inbound s2s ~ts authentication ~ts -> ~ts (~ts)",
 	      [xmpp_socket:pp(Socket), Mech, RServer, LServer,
 	       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
     State1 = case ejabberd_s2s:allow_host(ServerHost, RServer) of
@@ -195,18 +195,18 @@ handle_auth_failure(RServer, Mech, Reason,
 		    #{socket := Socket, ip := IP,
 		      server_host := ServerHost,
 		      lserver := LServer} = State) ->
-    ?WARNING_MSG("(~s) Failed inbound s2s ~s authentication ~s -> ~s (~s): ~s",
+    ?WARNING_MSG("(~ts) Failed inbound s2s ~ts authentication ~ts -> ~ts (~ts): ~ts",
 		 [xmpp_socket:pp(Socket), Mech, RServer, LServer,
 		  ejabberd_config:may_hide_data(misc:ip_to_list(IP)), Reason]),
     ejabberd_hooks:run_fold(s2s_in_auth_result,
 			    ServerHost, State, [false, RServer]).
 
-handle_unauthenticated_packet(Pkt, #{server_host := LServer} = State) ->
+handle_unauthenticated_packet(Pkt, #{server_host := ServerHost} = State) ->
     ejabberd_hooks:run_fold(s2s_in_unauthenticated_packet,
-			    LServer, State, [Pkt]).
+			    ServerHost, State, [Pkt]).
 
-handle_authenticated_packet(Pkt, #{server_host := LServer} = State) when not ?is_stanza(Pkt) ->
-    ejabberd_hooks:run_fold(s2s_in_authenticated_packet, LServer, State, [Pkt]);
+handle_authenticated_packet(Pkt, #{server_host := ServerHost} = State) when not ?is_stanza(Pkt) ->
+    ejabberd_hooks:run_fold(s2s_in_authenticated_packet, ServerHost, State, [Pkt]);
 handle_authenticated_packet(Pkt0, #{ip := {IP, _}} = State) ->
     Pkt = xmpp:put_meta(Pkt0, ip, IP),
     From = xmpp:get_from(Pkt),
@@ -227,15 +227,15 @@ handle_authenticated_packet(Pkt0, #{ip := {IP, _}} = State) ->
 	    send(State, Err)
     end.
 
-handle_cdata(Data, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_cdata, LServer, State, [Data]).
+handle_cdata(Data, #{server_host := ServerHost} = State) ->
+    ejabberd_hooks:run_fold(s2s_in_handle_cdata, ServerHost, State, [Data]).
 
-handle_recv(El, Pkt, #{server_host := LServer} = State) ->
+handle_recv(El, Pkt, #{server_host := ServerHost} = State) ->
     State1 = set_idle_timeout(State),
-    ejabberd_hooks:run_fold(s2s_in_handle_recv, LServer, State1, [El, Pkt]).
+    ejabberd_hooks:run_fold(s2s_in_handle_recv, ServerHost, State1, [El, Pkt]).
 
-handle_send(Pkt, Result, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_send, LServer,
+handle_send(Pkt, Result, #{server_host := ServerHost} = State) ->
+    ejabberd_hooks:run_fold(s2s_in_handle_send, ServerHost,
 			    State, [Pkt, Result]).
 
 init([State, Opts]) ->
@@ -252,11 +252,11 @@ init([State, Opts]) ->
 		   false -> [compression_none | TLSOpts1];
 		   true -> TLSOpts1
 	       end,
-    Timeout = ejabberd_config:negotiation_timeout(),
+    Timeout = ejabberd_option:negotiation_timeout(),
     State1 = State#{tls_options => TLSOpts2,
 		    auth_domains => sets:new(),
 		    xmlns => ?NS_SERVER,
-		    lang => ejabberd_config:get_mylang(),
+		    lang => ejabberd_option:language(),
 		    server => ejabberd_config:get_myname(),
 		    lserver => ejabberd_config:get_myname(),
 		    server_host => ejabberd_config:get_myname(),
@@ -265,25 +265,25 @@ init([State, Opts]) ->
     State2 = xmpp_stream_in:set_timeout(State1, Timeout),
     ejabberd_hooks:run_fold(s2s_in_init, {ok, State2}, [Opts]).
 
-handle_call(Request, From, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_call, LServer, State, [Request, From]).
+handle_call(Request, From, #{server_host := ServerHost} = State) ->
+    ejabberd_hooks:run_fold(s2s_in_handle_call, ServerHost, State, [Request, From]).
 
 handle_cast({update_state, Fun}, State) ->
     case Fun of
 	{M, F, A} -> erlang:apply(M, F, [State|A]);
 	_ when is_function(Fun) -> Fun(State)
     end;
-handle_cast(Msg, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_cast, LServer, State, [Msg]).
+handle_cast(Msg, #{server_host := ServerHost} = State) ->
+    ejabberd_hooks:run_fold(s2s_in_handle_cast, ServerHost, State, [Msg]).
 
-handle_info(Info, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_info, LServer, State, [Info]).
+handle_info(Info, #{server_host := ServerHost} = State) ->
+    ejabberd_hooks:run_fold(s2s_in_handle_info, ServerHost, State, [Info]).
 
 terminate(Reason, #{auth_domains := AuthDomains,
 		    socket := Socket} = State) ->
     case maps:get(stop_reason, State, undefined) of
 	{tls, _} = Err ->
-	    ?WARNING_MSG("(~s) Failed to secure inbound s2s connection: ~s",
+	    ?WARNING_MSG("(~ts) Failed to secure inbound s2s connection: ~ts",
 			 [xmpp_socket:pp(Socket), xmpp_stream_in:format_error(Err)]);
 	_ ->
 	    ok
@@ -327,9 +327,9 @@ check_to(#jid{lserver = LServer}, _State) ->
     ejabberd_router:is_my_route(LServer).
 
 -spec set_idle_timeout(state()) -> state().
-set_idle_timeout(#{server_host := LServer,
+set_idle_timeout(#{server_host := ServerHost,
 		   established := true} = State) ->
-    Timeout = ejabberd_s2s:get_idle_timeout(LServer),
+    Timeout = ejabberd_s2s:get_idle_timeout(ServerHost),
     xmpp_stream_in:set_timeout(State, Timeout);
 set_idle_timeout(State) ->
     State.
@@ -337,20 +337,11 @@ set_idle_timeout(State) ->
 -spec change_shaper(state(), binary()) -> state().
 change_shaper(#{shaper := ShaperName, server_host := ServerHost} = State,
 	      RServer) ->
-    Shaper = acl:match_rule(ServerHost, ShaperName, jid:make(RServer)),
+    Shaper = ejabberd_shaper:match(ServerHost, ShaperName, jid:make(RServer)),
     xmpp_stream_in:change_shaper(State, ejabberd_shaper:new(Shaper)).
-
-listen_opt_type(certfile = Opt) ->
-    fun(S) ->
-	    ?WARNING_MSG("Listening option '~s' for ~s is deprecated, use "
-			 "'certfiles' global option instead", [Opt, ?MODULE]),
-	    {ok, File} = ejabberd_pkix:add_certfile(S),
-	    File
-    end.
 
 listen_options() ->
     [{shaper, none},
-     {certfile, undefined},
      {ciphers, undefined},
      {dhfile, undefined},
      {cafile, undefined},

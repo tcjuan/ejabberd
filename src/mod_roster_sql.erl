@@ -4,7 +4,7 @@
 %%% Created : 14 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,6 @@
 
 -module(mod_roster_sql).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 -behaviour(mod_roster).
 
@@ -33,11 +32,13 @@
 	 get_roster/2, get_roster_item/3, roster_subscribe/4,
 	 read_subscription_and_groups/3, remove_user/2,
 	 update_roster/4, del_roster/3, transaction/2,
+	 process_rosteritems/5,
 	 import/3, export/1, raw_to_record/2]).
 
 -include("mod_roster.hrl").
 -include("ejabberd_sql_pt.hrl").
 -include("logger.hrl").
+-include("jid.hrl").
 
 %%%===================================================================
 %%% API
@@ -317,7 +318,7 @@ raw_to_record(LServer,
 		  subscription = Subscription, ask = Ask,
 		  askmessage = SAskMessage}
     catch _:{bad_jid, _} ->
-	    ?ERROR_MSG("~s", [format_row_error(User, LServer, {jid, SJID})]),
+	    ?ERROR_MSG("~ts", [format_row_error(User, LServer, {jid, SJID})]),
 	    error
     end.
 
@@ -350,7 +351,7 @@ decode_subscription(User, Server, S) ->
 	<<"N">> -> none;
 	<<"">> -> none;
 	_ ->
-	    ?ERROR_MSG("~s", [format_row_error(User, Server, {subscription, S})]),
+	    ?ERROR_MSG("~ts", [format_row_error(User, Server, {subscription, S})]),
 	    none
     end.
 
@@ -364,7 +365,7 @@ decode_ask(User, Server, A) ->
 	<<"N">> -> none;
 	<<"">> -> none;
 	_ ->
-	    ?ERROR_MSG("~s", [format_row_error(User, Server, {ask, A})]),
+	    ?ERROR_MSG("~ts", [format_row_error(User, Server, {ask, A})]),
 	    none
     end.
 
@@ -375,3 +376,39 @@ format_row_error(User, Server, Why) ->
 	 {ask, Ask} -> ["Malformed 'ask' field with value '", Ask, "'"]
      end,
      " detected for ", User, "@", Server, " in table 'rosterusers'"].
+
+process_rosteritems(ActionS, SubsS, AsksS, UsersS, ContactsS) ->
+    process_rosteritems_sql(ActionS, list_to_atom(SubsS), list_to_atom(AsksS),
+	list_to_binary(UsersS), list_to_binary(ContactsS)).
+
+process_rosteritems_sql(ActionS, Subscription, Ask, SLocalJID, SJID) ->
+    [LUser, LServer] = binary:split(SLocalJID, <<"@">>),
+    SSubscription = case Subscription of
+		      any -> <<"_">>;
+		      both -> <<"B">>;
+		      to -> <<"T">>;
+		      from -> <<"F">>;
+		      none -> <<"N">>
+		    end,
+    SAsk = case Ask of
+	     any -> <<"_">>;
+	     subscribe -> <<"S">>;
+	     unsubscribe -> <<"U">>;
+	     both -> <<"B">>;
+	     out -> <<"O">>;
+	     in -> <<"I">>;
+	     none -> <<"N">>
+	   end,
+    {selected, List} = ejabberd_sql:sql_query(
+      LServer,
+      ?SQL("select @(username)s, @(jid)s from rosterusers "
+           "where username LIKE %(LUser)s"
+	   " and %(LServer)H"
+	   " and jid LIKE %(SJID)s"
+	   " and subscription LIKE %(SSubscription)s"
+	   " and ask LIKE %(SAsk)s")),
+    case ActionS of
+	"delete" -> [mod_roster:del_roster(User, LServer, jid:tolower(jid:decode(Contact))) || {User, Contact} <- List];
+	"list" -> ok
+    end,
+    List.

@@ -5,7 +5,7 @@
 %%% Created : 10 Aug 2008 by Badlop <badlop@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -29,9 +29,10 @@
 -behaviour(gen_mod).
 
 -include("logger.hrl").
+-include("translate.hrl").
 
 -export([start/2, stop/1, reload/3, mod_options/1,
-	 get_commands_spec/0, depends/2]).
+	 get_commands_spec/0, depends/2, mod_doc/0]).
 
 % Commands API
 -export([
@@ -57,7 +58,7 @@
 
 	 % Roster
 	 add_rosteritem/7, delete_rosteritem/4,
-	 process_rosteritems/5, get_roster/2, push_roster/3,
+	 get_roster/2, push_roster/3,
 	 push_roster_all/1, push_alltoall/2,
 	 push_roster_item/5, build_roster_item/3,
 
@@ -399,7 +400,8 @@ get_commands_spec() ->
 			    "connected)\n\n'status' is a free text "
 			    "defined by the user client.",
 			module = ?MODULE, function = get_presence,
-			args = [{user, binary}, {server, binary}],
+			args = [{user, binary}, {host, binary}],
+			args_rename = [{server, host}],
 			args_example = [<<"peter">>, <<"myexample.com">>],
 			args_desc = ["User name", "Server name"],
 			result_example = {<<"user1@myserver.com/tka">>, <<"dnd">>, <<"Busy">>},
@@ -485,10 +487,11 @@ get_commands_spec() ->
 			desc = "Add an item to a user's roster (supports ODBC)",
 			longdesc = "Group can be several groups separated by ; for example: \"g1;g2;g3\"",
 			module = ?MODULE, function = add_rosteritem,
-			args = [{localuser, binary}, {localserver, binary},
-				{user, binary}, {server, binary},
+			args = [{localuser, binary}, {localhost, binary},
+				{user, binary}, {host, binary},
 				{nick, binary}, {group, binary},
 				{subs, binary}],
+			args_rename = [{localserver, localhost}, {server, host}],
 			args_example = [<<"user1">>,<<"myserver.com">>,<<"user2">>, <<"myserver.com">>,
 				<<"User 2">>, <<"Friends">>, <<"both">>],
 			args_desc = ["User name", "Server name", "Contact user name", "Contact server name",
@@ -500,13 +503,14 @@ get_commands_spec() ->
      #ejabberd_commands{name = delete_rosteritem, tags = [roster],
 			desc = "Delete an item from a user's roster (supports ODBC)",
 			module = ?MODULE, function = delete_rosteritem,
-			args = [{localuser, binary}, {localserver, binary},
-				{user, binary}, {server, binary}],
+			args = [{localuser, binary}, {localhost, binary},
+				{user, binary}, {host, binary}],
+			args_rename = [{localserver, localhost}, {server, host}],
 			args_example = [<<"user1">>,<<"myserver.com">>,<<"user2">>, <<"myserver.com">>],
 			args_desc = ["User name", "Server name", "Contact user name", "Contact server name"],
 			result = {res, rescode}},
      #ejabberd_commands{name = process_rosteritems, tags = [roster],
-			desc = "List/delete rosteritems that match filter (only Mnesia)",
+			desc = "List/delete rosteritems that match filter",
 			longdesc = "Explanation of each argument:\n"
 			" - action: what to do with each rosteritem that "
 			"matches all the filtering options\n"
@@ -514,6 +518,8 @@ get_commands_spec() ->
 			" - asks: pending subscription\n"
 			" - users: the JIDs of the local user\n"
 			" - contacts: the JIDs of the contact in the roster\n"
+			"\n"
+			" *** Mnesia: \n"
 			"\n"
 			"Allowed values in the arguments:\n"
 			"  ACTION = list | delete\n"
@@ -532,8 +538,26 @@ get_commands_spec() ->
 			"'example.org' and that the contact JID is either a "
 			"bare server name (without user part) or that has a "
 			"user part and the server part contains the word 'icq'"
-			":\n  list none:from:to any *@example.org *:*@*icq*",
-			module = ?MODULE, function = process_rosteritems,
+			":\n  list none:from:to any *@example.org *:*@*icq*"
+			"\n\n"
+			" *** SQL:\n"
+			"\n"
+			"Allowed values in the arguments:\n"
+			"  ACTION = list | delete\n"
+			"  SUBS = any | none | from | to | both\n"
+			"  ASKS = any | none | out | in\n"
+			"  USERS = JID\n"
+			"  CONTACTS = JID\n"
+			"  JID = characters valid in a JID, and can use the "
+			"globs: _ and %\n"
+			"\n"
+			"This example will list roster items with subscription "
+			"'to' that have any ask property, of "
+			"local users which JID is in the virtual host "
+			"'example.org' and that the contact JID's "
+			"server part contains the word 'icq'"
+			":\n  list to any %@example.org %@%icq%",
+			module = mod_roster, function = process_rosteritems,
 			args = [{action, string}, {subs, string},
 				{asks, string}, {users, string},
 				{contacts, string}],
@@ -549,6 +573,7 @@ get_commands_spec() ->
                         policy = user,
 			module = ?MODULE, function = get_roster,
 			args = [],
+			args_rename = [{server, host}],
 			result = {contacts, {list, {contact, {tuple, [
 								      {jid, string},
 								      {nick, string},
@@ -560,8 +585,10 @@ get_commands_spec() ->
 			desc = "Push template roster from file to a user",
 			longdesc = "The text file must contain an erlang term: a list "
 			    "of tuples with username, servername, group and nick. Example:\n"
-			    "[{\"user1\", \"localhost\", \"Workers\", \"User 1\"},\n"
-			    " {\"user2\", \"localhost\", \"Workers\", \"User 2\"}].",
+			    "[{<<\"user1\">>, <<\"localhost\">>, <<\"Workers\">>, <<\"User 1\">>},\n"
+			    " {<<\"user2\">>, <<\"localhost\">>, <<\"Workers\">>, <<\"User 2\">>}].\n"
+			    "When using UTF8 character encoding add /utf8 to certain string. Example:\n"
+			    "[{<<\"user2\">>, <<\"localhost\">>, <<\"Workers\"/utf8>>, <<\"User 2\"/utf8>>}].",
 			module = ?MODULE, function = push_roster,
 			args = [{file, binary}, {user, binary}, {host, binary}],
 			args_example = [<<"/home/ejabberd/roster.txt">>, <<"user1">>, <<"localhost">>],
@@ -622,7 +649,7 @@ get_commands_spec() ->
 			module = ?MODULE, function = private_set,
 			args = [{user, binary}, {host, binary}, {element, binary}],
 			args_example = [<<"user1">>,<<"myserver.com">>,
-                            <<"<query xmlns='jabber:iq:private'> <storage xmlns='storage:rosternotes'/></query>">>],
+                            <<"<storage xmlns='storage:rosternotes'/>">>],
 			args_desc = ["User name", "Server name", "XML storage element"],
 			result = {res, rescode}},
 
@@ -698,17 +725,22 @@ get_commands_spec() ->
 			policy = user,
 			module = mod_offline, function = count_offline_messages,
 			args = [],
+			args_rename = [{server, host}],
 			result_example = 5,
 			result_desc = "Number",
 			result = {value, integer}},
      #ejabberd_commands{name = send_message, tags = [stanza],
 			desc = "Send a message to a local or remote bare of full JID",
+			longdesc = "When sending a groupchat message to a MUC room, "
+			"FROM must be the full JID of a room occupant, "
+			"or the bare JID of a MUC service admin, "
+			"or the bare JID of a MUC/Sub subscribed user.",
 			module = ?MODULE, function = send_message,
 			args = [{type, binary}, {from, binary}, {to, binary},
 				{subject, binary}, {body, binary}],
 			args_example = [<<"headline">>, <<"admin@localhost">>, <<"user1@localhost">>,
 				<<"Restart">>, <<"In 5 minutes">>],
-			args_desc = ["Message type: normal, chat, headline", "Sender JID",
+			args_desc = ["Message type: normal, chat, headline, groupchat", "Sender JID",
 				"Receiver JID", "Subject, or empty string", "Body"],
 			result = {res, rescode}},
      #ejabberd_commands{name = send_stanza_c2s, tags = [stanza],
@@ -822,7 +854,7 @@ check_password_hash(User, Host, PasswordHash, HashMethod) ->
 			  {A, _} when is_tuple(A) -> scrammed;
 			  {_, true} -> get_hash(AccountPass, HashMethod);
 			  {_, false} ->
-			      ?ERROR_MSG("check_password_hash called "
+			      ?ERROR_MSG("Check_password_hash called "
 					 "with hash method: ~p", [HashMethod]),
 			      undefined
 		      end,
@@ -856,7 +888,7 @@ delete_old_users_vhost(Host, Days) ->
 
 delete_old_users(Days, Users) ->
     SecOlder = Days*24*60*60,
-    TimeStamp_now = p1_time_compat:system_time(seconds),
+    TimeStamp_now = erlang:system_time(second),
     TimeStamp_oldest = TimeStamp_now - SecOlder,
     F = fun({LUser, LServer}) ->
 	    case catch delete_or_not(LUser, LServer, TimeStamp_oldest) of
@@ -985,11 +1017,15 @@ get_status_list(Host, Status_required) ->
 	apply(Fstatus, [Status, Status_required])].
 
 connected_users_info() ->
-    lists:map(
+    lists:filtermap(
       fun({U, S, R}) ->
-	    Info = user_session_info(U, S, R),
-	    Jid = jid:encode(jid:make(U, S, R)),
-	    erlang:insert_element(1, Info, Jid)
+	    case user_session_info(U, S, R) of
+		offline ->
+		    false;
+		Info ->
+		    Jid = jid:encode(jid:make(U, S, R)),
+		    {true, erlang:insert_element(1, Info, Jid)}
+	    end
       end,
       ejabberd_sm:dirty_get_sessions_list()).
 
@@ -1052,23 +1088,31 @@ set_presence(User, Host, Resource, Type, Show, Status, Priority0) ->
     ejabberd_c2s:set_presence(Ref, Pres).
 
 user_sessions_info(User, Host) ->
-    [user_session_info(User, Host, Resource) ||
-    Resource <- ejabberd_sm:get_user_resources(User, Host)].
+    lists:filtermap(fun(Resource) ->
+			    case user_session_info(User, Host, Resource) of
+				offline -> false;
+				Info -> {true, Info}
+			    end
+		    end, ejabberd_sm:get_user_resources(User, Host)).
 
 user_session_info(User, Host, Resource) ->
     CurrentSec = calendar:datetime_to_gregorian_seconds({date(), time()}),
-    Info = ejabberd_sm:get_user_info(User, Host, Resource),
-    Now = proplists:get_value(ts, Info),
-    Pid = proplists:get_value(pid, Info),
-    {_U, _Resource, Status, StatusText} = get_presence(Pid),
-    Priority = proplists:get_value(priority, Info),
-    Conn = proplists:get_value(conn, Info),
-    {Ip, Port} = proplists:get_value(ip, Info),
-    IPS = inet_parse:ntoa(Ip),
-    NodeS = atom_to_list(node(Pid)),
-    Uptime = CurrentSec - calendar:datetime_to_gregorian_seconds(
-	    calendar:now_to_local_time(Now)),
-    {atom_to_list(Conn), IPS, Port, num_prio(Priority), NodeS, Uptime, Status, Resource, StatusText}.
+    case ejabberd_sm:get_user_info(User, Host, Resource) of
+	offline ->
+	    offline;
+	Info ->
+	    Now = proplists:get_value(ts, Info),
+	    Pid = proplists:get_value(pid, Info),
+	    {_U, _Resource, Status, StatusText} = get_presence(Pid),
+	    Priority = proplists:get_value(priority, Info),
+	    Conn = proplists:get_value(conn, Info),
+	    {Ip, Port} = proplists:get_value(ip, Info),
+	    IPS = inet_parse:ntoa(Ip),
+	    NodeS = atom_to_list(node(Pid)),
+	    Uptime = CurrentSec - calendar:datetime_to_gregorian_seconds(
+				    calendar:now_to_local_time(Now)),
+	    {atom_to_list(Conn), IPS, Port, num_prio(Priority), NodeS, Uptime, Status, Resource, StatusText}
+    end.
 
 
 %%%
@@ -1152,8 +1196,7 @@ set_vcard_content(User, Server, Data, SomeContent) ->
 	 end,
     %% Build new vcard
     SubEl = {xmlel, <<"vCard">>, [{<<"xmlns">>,<<"vcard-temp">>}], A4},
-    mod_vcard:set_vcard(User, jid:nameprep(Server), SubEl),
-    ok.
+    mod_vcard:set_vcard(User, jid:nameprep(Server), SubEl).
 
 take_vcard_tel(TelType, [{xmlel, <<"TEL">>, _, SubEls}=OldEl | OldEls], NewEls, Taken) ->
     {Taken2, NewEls2} = case lists:keymember(TelType, 2, SubEls) of
@@ -1200,33 +1243,24 @@ update_vcard_els(Data, ContentList, Els1) ->
 %%%
 
 add_rosteritem(LocalUser, LocalServer, User, Server, Nick, Group, Subs) ->
-    case add_rosteritem(LocalUser, LocalServer, User, Server, Nick, Group, Subs, []) of
-	{atomic, ok} ->
-	    push_roster_item(LocalUser, LocalServer, User, Server, {add, Nick, Subs, Group}),
-	    ok;
-	_ ->
-	    error
+    Jid = jid:make(LocalUser, LocalServer),
+    RosterItem = build_roster_item(User, Server, {add, Nick, Subs, Group}),
+    case mod_roster:set_item_and_notify_clients(Jid, RosterItem, true) of
+	ok -> ok;
+	_ -> error
     end.
-
-add_rosteritem(LU, LS, User, Server, Nick, Group, Subscription, Xattrs) ->
-    subscribe(LU, LS, User, Server, Nick, Group, Subscription, Xattrs).
 
 subscribe(LU, LS, User, Server, Nick, Group, Subscription, _Xattrs) ->
     ItemEl = build_roster_item(User, Server, {add, Nick, Subscription, Group}),
     mod_roster:set_items(LU, LS, #roster_query{items = [ItemEl]}).
 
 delete_rosteritem(LocalUser, LocalServer, User, Server) ->
-    case unsubscribe(LocalUser, LocalServer, User, Server) of
-	{atomic, ok} ->
-	    push_roster_item(LocalUser, LocalServer, User, Server, remove),
-	    ok;
-	_  ->
-	    error
+    Jid = jid:make(LocalUser, LocalServer),
+    RosterItem = build_roster_item(User, Server, remove),
+    case mod_roster:set_item_and_notify_clients(Jid, RosterItem, true) of
+	ok -> ok;
+	_ -> error
     end.
-
-unsubscribe(LU, LS, User, Server) ->
-    ItemEl = build_roster_item(User, Server, remove),
-    mod_roster:set_items(LU, LS, #roster_query{items = [ItemEl]}).
 
 %% -----------------------------
 %% Get Roster
@@ -1347,12 +1381,12 @@ get_last(User, Server) ->
         [] ->
             case mod_last:get_last_info(User, Server) of
                 not_found ->
-		    {p1_time_compat:timestamp(), "NOT FOUND"};
+		    {erlang:timestamp(), "NOT FOUND"};
                 {ok, Shift, Status1} ->
                     {{Shift div 1000000, Shift rem 1000000, 0}, Status1}
             end;
         _ ->
-	    {p1_time_compat:timestamp(), "ONLINE"}
+	    {erlang:timestamp(), "ONLINE"}
     end,
     {xmpp_util:encode_timestamp(Now), Status}.
 
@@ -1389,9 +1423,8 @@ private_set(Username, Host, ElementString) ->
 
 private_set2(Username, Host, Xml) ->
     NS = fxml:get_tag_attr_s(<<"xmlns">>, Xml),
-    mod_private:set_data(jid:nodeprep(Username), jid:nameprep(Host),
-			 [{NS, Xml}]),
-    ok.
+    JID = jid:make(Username, Host),
+    mod_private:set_data(JID, [{NS, Xml}]).
 
 %%%
 %%% Shared Roster Groups
@@ -1448,50 +1481,67 @@ srg_user_del(User, Host, Group, GroupHost) ->
 %% @doc Send a message to a Jabber account.
 %% @spec (Type::binary(), From::binary(), To::binary(), Subject::binary(), Body::binary()) -> ok
 send_message(Type, From, To, Subject, Body) ->
-    FromJID = jid:decode(From),
-    ToJID = jid:decode(To),
-    Packet = build_packet(Type, Subject, Body, FromJID, ToJID),
-    State1 = #{jid => FromJID},
-    ejabberd_hooks:run_fold(user_send_packet, FromJID#jid.lserver, {Packet, State1}, []),
-    ejabberd_router:route(xmpp:set_from_to(Packet, FromJID, ToJID)).
-
-build_packet(Type, Subject, Body, FromJID, ToJID) ->
-    #message{type = misc:binary_to_atom(Type),
-	     body = xmpp:mk_text(Body),
-	     from = FromJID,
-	     to = ToJID,
-	     id = p1_rand:get_string(),
-	     subject = xmpp:mk_text(Subject)}.
+    CodecOpts = ejabberd_config:codec_options(),
+    try xmpp:decode(
+          #xmlel{name = <<"message">>,
+                 attrs = [{<<"to">>, To},
+                          {<<"from">>, From},
+                          {<<"type">>, Type},
+                          {<<"id">>, p1_rand:get_string()}],
+                 children =
+                     [#xmlel{name = <<"subject">>,
+                             children = [{xmlcdata, Subject}]},
+                      #xmlel{name = <<"body">>,
+                             children = [{xmlcdata, Body}]}]},
+          ?NS_CLIENT, CodecOpts) of
+        #message{from = JID} = Msg ->
+            State = #{jid => JID},
+            ejabberd_hooks:run_fold(user_send_packet, JID#jid.lserver, {Msg, State}, []),
+            ejabberd_router:route(Msg)
+    catch _:{xmpp_codec, Why} ->
+            {error, xmpp:format_error(Why)}
+    end.
 
 send_stanza(FromString, ToString, Stanza) ->
     try
 	#xmlel{} = El = fxml_stream:parse_element(Stanza),
 	From = jid:decode(FromString),
 	To = jid:decode(ToString),
-	CodecOpts = ejabberd_config:codec_options(From#jid.lserver),
+	CodecOpts = ejabberd_config:codec_options(),
 	Pkt = xmpp:decode(El, ?NS_CLIENT, CodecOpts),
 	ejabberd_router:route(xmpp:set_from_to(Pkt, From, To))
     catch _:{xmpp_codec, Why} ->
-	    io:format("incorrect stanza: ~s~n", [xmpp:format_error(Why)]),
+	    io:format("incorrect stanza: ~ts~n", [xmpp:format_error(Why)]),
+	    {error, Why};
+	  _:{badmatch, {error, {Code, Why}}} when is_integer(Code) ->
+	    io:format("invalid xml: ~p~n", [Why]),
 	    {error, Why};
 	  _:{badmatch, {error, Why}} ->
 	    io:format("invalid xml: ~p~n", [Why]),
 	    {error, Why};
 	  _:{bad_jid, S} ->
-	    io:format("malformed JID: ~s~n", [S]),
+	    io:format("malformed JID: ~ts~n", [S]),
 	    {error, "JID malformed"}
     end.
 
+-spec send_stanza_c2s(binary(), binary(), binary(), binary()) -> ok | {error, any()}.
 send_stanza_c2s(Username, Host, Resource, Stanza) ->
-    case {fxml_stream:parse_element(Stanza),
-          ejabberd_sm:get_session_pid(Username, Host, Resource)}
-    of
-	{{error, Error}, _} ->
-	    {error, Error};
-	{_, none} ->
-	    {error, no_session};
-	{XmlEl, C2sPid} ->
-	    p1_fsm:send_event(C2sPid, {xmlstreamelement, XmlEl})
+    try
+	#xmlel{} = El = fxml_stream:parse_element(Stanza),
+	CodecOpts = ejabberd_config:codec_options(),
+	Pkt = xmpp:decode(El, ?NS_CLIENT, CodecOpts),
+	case ejabberd_sm:get_session_pid(Username, Host, Resource) of
+	    Pid when is_pid(Pid) ->
+		ejabberd_c2s:send(Pid, Pkt);
+	    _ ->
+		{error, no_session}
+	end
+    catch _:{badmatch, {error, Why} = Err} ->
+	    io:format("invalid xml: ~p~n", [Why]),
+	    Err;
+	  _:{xmpp_codec, Why} ->
+	    io:format("incorrect stanza: ~ts~n", [xmpp:format_error(Why)]),
+	    {error, Why}
     end.
 
 privacy_set(Username, Host, QueryS) ->
@@ -1511,7 +1561,7 @@ stats(Name) ->
     case Name of
 	<<"uptimeseconds">> -> trunc(element(1, erlang:statistics(wall_clock))/1000);
 	<<"processes">> -> length(erlang:processes());
-	<<"registeredusers">> -> lists:foldl(fun(Host, Sum) -> ejabberd_auth:count_users(Host) + Sum end, 0, ejabberd_config:get_myhosts());
+	<<"registeredusers">> -> lists:foldl(fun(Host, Sum) -> ejabberd_auth:count_users(Host) + Sum end, 0, ejabberd_option:hosts());
 	<<"onlineusersnode">> -> length(ejabberd_sm:dirty_get_my_sessions_list());
 	<<"onlineusers">> -> length(ejabberd_sm:dirty_get_sessions_list())
     end.
@@ -1523,163 +1573,19 @@ stats(Name, Host) ->
     end.
 
 
-
-%%-----------------------------
-%% Purge roster items
-%%-----------------------------
-
-process_rosteritems(ActionS, SubsS, AsksS, UsersS, ContactsS) ->
-    Action = case ActionS of
-		 "list" -> list;
-		 "delete" -> delete
-	     end,
-
-    Subs = lists:foldl(
-	     fun(any, _) -> [none, from, to, both];
-		(Sub, Subs) -> [Sub | Subs]
-	     end,
-	     [],
-	     [list_to_atom(S) || S <- string:tokens(SubsS, ":")]
-	    ),
-
-    Asks = lists:foldl(
-	     fun(any, _) -> [none, out, in];
-		(Ask, Asks) -> [Ask | Asks]
-	     end,
-	     [],
-	     [list_to_atom(S) || S <- string:tokens(AsksS, ":")]
-	    ),
-
-    Users = lists:foldl(
-	      fun("any", _) -> ["*", "*@*"];
-		 (U, Us) -> [U | Us]
-	      end,
-	      [],
-	      [S || S <- string:tokens(UsersS, ":")]
-	     ),
-
-    Contacts = lists:foldl(
-		 fun("any", _) -> ["*", "*@*"];
-		    (U, Us) -> [U | Us]
-		 end,
-		 [],
-		 [S || S <- string:tokens(ContactsS, ":")]
-		),
-
-    rosteritem_purge({Action, Subs, Asks, Users, Contacts}).
-
-%% @spec ({Action::atom(), Subs::[atom()], Asks::[atom()], User::string(), Contact::string()}) -> {atomic, ok}
-rosteritem_purge(Options) ->
-    Num_rosteritems = mnesia:table_info(roster, size),
-    io:format("There are ~p roster items in total.~n", [Num_rosteritems]),
-    Key = mnesia:dirty_first(roster),
-    rip(Key, Options, {0, Num_rosteritems, 0, 0}, []).
-
-rip('$end_of_table', _Options, Counters, Res) ->
-    print_progress_line(Counters),
-    Res;
-rip(Key, Options, {Pr, NT, NV, ND}, Res) ->
-    Key_next = mnesia:dirty_next(roster, Key),
-    {Action, _, _, _, _} = Options,
-    {ND2, Res2} = case decide_rip(Key, Options) of
-	      true ->
-		  Jids = apply_action(Action, Key),
-		  {ND+1, [Jids | Res]};
-	      false ->
-		  {ND, Res}
-	  end,
-    NV2 = NV+1,
-    Pr2 = print_progress_line({Pr, NT, NV2, ND2}),
-    rip(Key_next, Options, {Pr2, NT, NV2, ND2}, Res2).
-
-apply_action(list, Key) ->
-    {User, Server, JID} = Key,
-    {RUser, RServer, _} = JID,
-    Jid1string = <<User/binary, "@", Server/binary>>,
-    Jid2string = <<RUser/binary, "@", RServer/binary>>,
-    io:format("Matches: ~s ~s~n", [Jid1string, Jid2string]),
-    {Jid1string, Jid2string};
-apply_action(delete, Key) ->
-    R = apply_action(list, Key),
-    mnesia:dirty_delete(roster, Key),
-    R.
-
-print_progress_line({_Pr, 0, _NV, _ND}) ->
-    ok;
-print_progress_line({Pr, NT, NV, ND}) ->
-    Pr2 = trunc((NV/NT)*100),
-    case Pr == Pr2 of
-	true ->
-	    ok;
-	false ->
-	    io:format("Progress ~p% - visited ~p - deleted ~p~n", [Pr2, NV, ND])
-    end,
-    Pr2.
-
-decide_rip(Key, {_Action, Subs, Asks, User, Contact}) ->
-    case catch mnesia:dirty_read(roster, Key) of
-	[RI] ->
-	    lists:member(RI#roster.subscription, Subs)
-		andalso lists:member(RI#roster.ask, Asks)
-		andalso decide_rip_jid(RI#roster.us, User)
-		andalso decide_rip_jid(RI#roster.jid, Contact);
-	_ ->
-	    false
-    end.
-
-%% Returns true if the server of the JID is included in the servers
-decide_rip_jid({UName, UServer, _UResource}, Match_list) ->
-    decide_rip_jid({UName, UServer}, Match_list);
-decide_rip_jid({UName, UServer}, Match_list) ->
-    lists:any(
-      fun(Match_string) ->
-	      MJID = jid:decode(list_to_binary(Match_string)),
-	      MName = MJID#jid.luser,
-	      MServer = MJID#jid.lserver,
-	      Is_server = is_glob_match(UServer, MServer),
-	      case MName of
-		  <<>> when UName == <<>> ->
-		      Is_server;
-		  <<>> ->
-		      false;
-		  _ ->
-		      Is_server
-			  andalso is_glob_match(UName, MName)
-	      end
-      end,
-      Match_list).
-
 user_action(User, Server, Fun, OK) ->
     case ejabberd_auth:user_exists(User, Server) of
         true ->
- 	    case catch Fun() of
+            case catch Fun() of
                 OK -> ok;
- 		{error, Error} -> throw(Error);
+                {error, Error} -> throw(Error);
                 Error ->
                     ?ERROR_MSG("Command returned: ~p", [Error]),
- 		    1
- 	    end;
- 	false ->
- 	    throw({not_found, "unknown_user"})
+                    1
+            end;
+        false ->
+            throw({not_found, "unknown_user"})
     end.
-
-%% Copied from ejabberd-2.0.0/src/acl.erl
-is_regexp_match(String, RegExp) ->
-    case ejabberd_regexp:run(String, RegExp) of
-	nomatch ->
-	    false;
-	match ->
-	    true;
-	{error, ErrDesc} ->
-	    io:format(
-	      "Wrong regexp ~p in ACL: ~p",
-	      [RegExp, ErrDesc]),
-	    false
-    end.
-is_glob_match(String, <<"!", Glob/binary>>) ->
-    not is_regexp_match(String, ejabberd_regexp:sh_to_awk(Glob));
-is_glob_match(String, Glob) ->
-    is_regexp_match(String, ejabberd_regexp:sh_to_awk(Glob)).
 
 num_prio(Priority) when is_integer(Priority) ->
     Priority;
@@ -1687,3 +1593,59 @@ num_prio(_) ->
     -1.
 
 mod_options(_) -> [].
+
+mod_doc() ->
+    #{desc =>
+          [?T("This module provides additional administrative commands."), "",
+           ?T("Details for some commands:"), "",
+           ?T("- 'ban-acount':"),
+           ?T("This command kicks all the connected sessions of the
+           account from the server. It also changes their password to
+           a randomly generated one, so they can't login anymore
+           unless a server administrator changes their password
+           again. It is possible to define the reason of the ban. The
+           new password also includes the reason and the date and time
+           of the ban. For example, if this command is called:
+           'ejabberdctl vhost example.org ban-account boby \"Spammed
+           rooms\"', then the sessions of the local account which JID
+           is boby@example.org will be kicked, and its password will
+           be set to something like this:
+           'BANNED_ACCOUNT--20080425T21:45:07--2176635--Spammed_rooms'"),
+           ?T("- 'pushroster' (and 'pushroster-all'):"),
+           ?T("The roster file must be placed, if using Windows, on
+           the directory where you installed ejabberd: C:/Program
+           Files/ejabberd or similar. If you use other Operating
+           System, place the file on the same directory where the
+           .beam files are installed. See below an example roster
+           file."),
+           ?T("- 'srg-create':"),
+           ?T("If you want to put a group Name with blankspaces, use
+           the characters \"\' and \\'\" to define when the Name
+           starts and ends. For example: 'ejabberdctl srg-create g1
+           example.org \"\'Group number 1\\'\" this_is_g1 g1'")],
+      opts =>
+          [{module_resource,
+            #{value => ?T("Resource"),
+              desc =>
+                  ?T("Indicate the resource that the XMPP stanzas must
+                  use in the FROM or TO JIDs. This is only useful in
+                  the 'get_vcard*' and 'set_vcard*' commands. The
+                  default value is 'mod_admin_extra'.")}}],
+      example =>
+	  [{?T("With this configuration, vCards can only be modified
+	    with mod_admin_extra commands:"),
+	    ["acl:",
+	     "  adminextraresource:",
+	     "    - resource: \"modadminextraf8x,31ad\"",
+	     "access_rules:",
+	     "  vcard_set:",
+	     "    - allow: adminextraresource",
+	     "modules:",
+	     "  mod_admin_extra:",
+	     "    module_resource: \"modadminextraf8x,31ad\"",
+	     "  mod_vcard:",
+	     "    access_set: vcard_set"]},
+	   {?T("Content of roster file for 'pushroster' command:"),
+	    ["[{<<\"bob\">>, <<\"example.org\">>, <<\"workers\">>, <<\"Bob\">>},",
+	     "{<<\"mart\">>, <<\"example.org\">>, <<\"workers\">>, <<\"Mart\">>},",
+	     "{<<\"Rich\">>, <<\"example.org\">>, <<\"bosses\">>, <<\"Rich\">>}]."]}]}.

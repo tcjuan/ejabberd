@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,7 +26,6 @@
 
 -behaviour(mod_last).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/2, get_last/2, store_last_info/4, remove_user/2,
@@ -56,10 +55,11 @@ get_last(LUser, LServer) ->
     end.
 
 store_last_info(LUser, LServer, TimeStamp, Status) ->
+    TS = integer_to_binary(TimeStamp),
     case ?SQL_UPSERT(LServer, "last",
 		     ["!username=%(LUser)s",
                       "!server_host=%(LServer)s",
-		      "seconds=%(TimeStamp)d",
+		      "seconds=%(TS)s",
 		      "state=%(Status)s"]) of
 	ok ->
 	    ok;
@@ -77,11 +77,12 @@ export(_Server) ->
       fun(Host, #last_activity{us = {LUser, LServer},
                                timestamp = TimeStamp, status = Status})
             when LServer == Host ->
+              TS = integer_to_binary(TimeStamp),
               [?SQL("delete from last where username=%(LUser)s and %(LServer)H;"),
                ?SQL_INSERT("last",
                            ["username=%(LUser)s",
                             "server_host=%(LServer)s",
-                            "seconds=%(TimeStamp)d",
+                            "seconds=%(TS)s",
                             "state=%(Status)s"])];
          (_Host, _R) ->
               []
