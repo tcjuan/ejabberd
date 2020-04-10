@@ -1486,7 +1486,7 @@ get_default_role(Affiliation, StateData) ->
       outcast -> none;
       none ->
 	  case (StateData#state.config)#config.members_only of
-	    true -> participant;
+	    true -> none;
 	    _ ->
 		case (StateData#state.config)#config.members_by_default
 		    of
@@ -1495,50 +1495,6 @@ get_default_role(Affiliation, StateData) ->
 		end
 	  end
     end.
-
--spec get_default_role_with_group(affiliation(), state(),jid()) -> role().
-get_default_role_with_group(Affiliation, StateData ,From) ->
-    case Affiliation of
-      owner -> moderator;
-      admin -> moderator;
-      member -> participant;
-      outcast -> none;
-      none ->
-	   GroupList = mod_shared_roster_ldap:get_user_displayed_groups({From#jid.user, StateData#state.server_host}),
-	  
-	  case (StateData#state.config)#config.members_only of
-	    true -> 
-			AffList = lists:flatmap(fun(J)->
-						  AffNew =get_affiliation(jid:make(J, StateData#state.server_host), StateData) ,
-						  ?DEBUG("Affilation! ~s~n" , [AffNew]) ,
-					 case  AffNew of
-						member ->
-						%%	?DEBUG("find in Affilation! ~s~n" , [J]),
-						    [participant];
-						_ -> []
-						%%	?DEBUG("Miss in Affilation! ~s~n" , [J]),
-						%%	[ok,none]
-					 end
-					%% ?DEBUG("each groups! ~s~n" , [J])
-				   end 
-				  ,GroupList),
-				 %% ?DEBUG("AffList for groups! ~w~n" , [AffList]);
-		   
-			case lists:member(participant, AffList ) of
-				true ->
-				  participant ;
-				false ->
-					none
-		    end;
-		_ ->
-		case (StateData#state.config)#config.members_by_default
-		    of
-		  true -> participant;
-		  _ -> visitor
-		end
-	  end
-    end.
-
 
 -spec is_visitor(jid(), state()) -> boolean().
 is_visitor(Jid, StateData) ->
@@ -1925,23 +1881,6 @@ add_new_user(From, Nick, Packet, StateData) ->
 			       mod_muc, max_user_conferences),
     Collision = nick_collision(From, Nick, StateData),
     IsSubscribeRequest = not is_record(Packet, presence),
-	Affiliations = get_affiliations(StateData),
-	Group_list = mod_shared_roster_ldap:get_user_displayed_groups({From#jid.user, StateData#state.server_host}),
-	TT = Affiliations,
-	 ?DEBUG("get_user_displayed_groups! ~w~n" , [Group_list]),
-	lists:foreach(fun(J)->
-						  AffNew =get_affiliation(jid:make(J, StateData#state.server_host), StateData) ,
-						  ?DEBUG("Affilation! ~s~n" , [AffNew]) ,
-					 case  AffNew of
-						member ->
-							?DEBUG("find in Affilation! ~s~n" , [J]);
-						_ -> 
-							?DEBUG("Miss in Affilation! ~s~n" , [J])	 
-					 end,
-					 ?DEBUG("each groups! ~s~n" , [J])
-				   end 
-				  ,Group_list),
-    ?DEBUG("Affilations! ~w~n" , [Group_list]),
     case {(ServiceAffiliation == owner orelse
 	     ((Affiliation == admin orelse Affiliation == owner)
 	       andalso NUsers < MaxAdminUsers)
@@ -1950,7 +1889,7 @@ add_new_user(From, Nick, Packet, StateData) ->
 	  Collision,
 	  mod_muc:can_use_nick(StateData#state.server_host,
 			       StateData#state.host, From, Nick),
-	  get_default_role_with_group(Affiliation, StateData,From)}
+	  get_default_role(Affiliation, StateData)}
 	of
       {false, _, _, _} when NUsers >= MaxUsers orelse NUsers >= MaxAdminUsers ->
 	  Txt = <<"Too many users in this conference">>,
