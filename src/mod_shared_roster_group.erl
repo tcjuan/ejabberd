@@ -44,7 +44,7 @@
 -export([get_user_roster/2,
 	 get_jid_info/4, process_item/2, in_subscription/2,
 	 out_subscription/1, mod_opt_type/1, mod_options/1,
-	 opt_type/1, depends/2, transform_module_options/1]).
+	  depends/2, transform_module_options/1]).
 
 -include("logger.hrl").
 -include("xmpp.hrl").
@@ -53,7 +53,7 @@
 -include("ejabberd_http.hrl").
 -include("ejabberd_web_admin.hrl").
 -include("ejabberd_sql_pt.hrl").
-
+-include("translate.hrl").
 -define(USER_CACHE, shared_roster_ldap_user_cache).
 -define(GROUP_CACHE, shared_roster_ldap_group_cache).
 -define(LDAP_SEARCH_TIMEOUT, 5).    %% Timeout for LDAP search queries in seconds
@@ -916,75 +916,98 @@ import(LServer, {sql, _}, DBType, Tab, L) ->
 
 
 %%%%%%
-
 mod_opt_type(ldap_auth_check) ->
-    fun (on) -> true;
-	(off) -> false;
-	(false) -> false;
-	(true) -> true
-    end;
+    econf:bool();
 mod_opt_type(ldap_gfilter) ->
-    opt_type(ldap_gfilter);
-mod_opt_type(O) when O == cache_size;
-		     O == cache_life_time ->
-    fun (I) when is_integer(I), I > 0 -> I;
-	(infinity) -> infinity
-    end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(ldap_groupattr) -> fun iolist_to_binary/1;
+    econf:ldap_filter();
+mod_opt_type(ldap_groupattr) ->
+    econf:binary();
 mod_opt_type(ldap_groupdesc) ->
-    fun(undefined) -> undefined;
-       (G) -> iolist_to_binary(G)
-    end;
-mod_opt_type(ldap_memberattr) -> fun iolist_to_binary/1;
+    econf:binary();
+mod_opt_type(ldap_memberattr) ->
+    econf:binary();
 mod_opt_type(ldap_memberattr_format) ->
-    fun iolist_to_binary/1;
+    econf:binary();
 mod_opt_type(ldap_memberattr_format_re) ->
-    fun (S) ->
-	    Re = iolist_to_binary(S),
-	    case Re of
-		<<>> -> <<>>;
-		_ -> {ok, MP} = re:compile(Re), MP
-	    end
-    end;
+    econf:re();
 mod_opt_type(ldap_rfilter) ->
-    opt_type(ldap_rfilter);
+    econf:ldap_filter();
 mod_opt_type(ldap_ufilter) ->
-    opt_type(ldap_ufilter);
-mod_opt_type(ldap_userdesc) -> fun iolist_to_binary/1;
-mod_opt_type(ldap_useruid) -> fun iolist_to_binary/1;
-mod_opt_type(Opt) ->
-    eldap_utils:opt_type(Opt).
-
+    econf:ldap_filter();
+mod_opt_type(ldap_userdesc) ->
+    econf:binary();
+mod_opt_type(ldap_useruid) ->
+    econf:binary();
+mod_opt_type(ldap_backups) ->
+    econf:list(econf:domain(), [unique]);
+mod_opt_type(ldap_base) ->
+    econf:binary();
+mod_opt_type(ldap_deref_aliases) ->
+    econf:enum([never, searching, finding, always]);
+mod_opt_type(ldap_encrypt) ->
+    econf:enum([tls, starttls, none]);
+mod_opt_type(ldap_filter) ->
+    econf:ldap_filter();
+mod_opt_type(ldap_password) ->
+    econf:binary();
+mod_opt_type(ldap_port) ->
+    econf:port();
+mod_opt_type(ldap_rootdn) ->
+    econf:binary();
+mod_opt_type(ldap_servers) ->
+    econf:list(econf:domain(), [unique]);
+mod_opt_type(ldap_tls_cacertfile) ->
+    econf:pem();
+mod_opt_type(ldap_tls_certfile) ->
+    econf:pem();
+mod_opt_type(ldap_tls_depth) ->
+    econf:non_neg_int();
+mod_opt_type(ldap_tls_verify) ->
+    econf:enum([hard, soft, false]);
+mod_opt_type(ldap_uids) ->
+    econf:either(
+      econf:list(
+        econf:and_then(
+          econf:binary(),
+          fun(U) -> {U, <<"%u">>} end)),
+      econf:map(econf:binary(), econf:binary(), [unique]));
+mod_opt_type(use_cache) ->
+    econf:bool();
+mod_opt_type(cache_size) ->
+    econf:pos_int(infinity);
+mod_opt_type(cache_missed) ->
+    econf:bool();
+mod_opt_type(cache_life_time) ->
+    econf:timeout(second, infinity).
+-spec mod_options(binary()) -> [{ldap_uids, [{binary(), binary()}]} |
+                                {atom(), any()}].
 mod_options(Host) ->
     [{ldap_auth_check, true},
-     {ldap_gfilter, ejabberd_config:get_option({ldap_gfilter, Host}, <<"">>)},
+     {ldap_gfilter, <<"">>},
      {ldap_groupattr, <<"cn">>},
      {ldap_groupdesc, undefined},
      {ldap_memberattr, <<"memberUid">>},
      {ldap_memberattr_format, <<"%u">>},
-     {ldap_memberattr_format_re, <<"">>},
-     {ldap_rfilter, ejabberd_config:get_option({ldap_rfilter, Host}, <<"">>)},
-     {ldap_ufilter, ejabberd_config:get_option({ldap_ufilter, Host}, <<"">>)},
+     {ldap_memberattr_format_re, undefined},
+     {ldap_rfilter, <<"">>},
+     {ldap_ufilter, <<"">>},
      {ldap_userdesc, <<"cn">>},
      {ldap_useruid, <<"cn">>},
-     {use_cache, ejabberd_config:use_cache(Host)},
-     {cache_size, ejabberd_config:cache_size(Host)},
-     {cache_missed, ejabberd_config:cache_missed(Host)},
-     {cache_life_time, ejabberd_config:cache_life_time(Host)}
-     | lists:map(
-	 fun({Opt, Default}) ->
-		 {Opt, ejabberd_config:get_option({Opt, Host}, Default)}
-	 end, eldap_utils:options(Host))].
-
-opt_type(O) when O == ldap_rfilter; O == ldap_gfilter; O == ldap_ufilter ->
-    fun(<<>>) -> <<>>;
-       (F) -> eldap_utils:check_filter(F)
-    end;
-opt_type(_) ->
-    [ldap_gfilter, ldap_rfilter, ldap_ufilter].
-
-
-
-
+     {ldap_backups, ejabberd_option:ldap_backups(Host)},
+     {ldap_base, ejabberd_option:ldap_base(Host)},
+     {ldap_uids, ejabberd_option:ldap_uids(Host)},
+     {ldap_deref_aliases, ejabberd_option:ldap_deref_aliases(Host)},
+     {ldap_encrypt, ejabberd_option:ldap_encrypt(Host)},
+     {ldap_password, ejabberd_option:ldap_password(Host)},
+     {ldap_port, ejabberd_option:ldap_port(Host)},
+     {ldap_rootdn, ejabberd_option:ldap_rootdn(Host)},
+     {ldap_servers, ejabberd_option:ldap_servers(Host)},
+     {ldap_filter, ejabberd_option:ldap_filter(Host)},
+     {ldap_tls_certfile, ejabberd_option:ldap_tls_certfile(Host)},
+     {ldap_tls_cacertfile, ejabberd_option:ldap_tls_cacertfile(Host)},
+     {ldap_tls_depth, ejabberd_option:ldap_tls_depth(Host)},
+     {ldap_tls_verify, ejabberd_option:ldap_tls_verify(Host)},
+     {use_cache, ejabberd_option:use_cache(Host)},
+     {cache_size, ejabberd_option:cache_size(Host)},
+     {cache_missed, ejabberd_option:cache_missed(Host)},
+     {cache_life_time, ejabberd_option:cache_life_time(Host)}].
