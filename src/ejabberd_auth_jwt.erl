@@ -59,22 +59,27 @@ store_type(_Host) -> external.
 check_password(User, AuthzId, Server, Token) ->
     %% MREMOND: Should we move the AuthzId check at a higher level in
     %%          the call stack?
-    if AuthzId /= <<>> andalso AuthzId /= User ->
-            {nocache, false};
-       true ->
+      ?DEBUG("jwt verify: before", []),
+  %%  if AuthzId /= <<>> andalso AuthzId /= User ->
+   %%         {nocache, false};
+   %%    true ->
             if Token == <<"">> -> {nocache, false};
                true ->
+ ?DEBUG("jwt verify: after", []),
                     Res = check_jwt_token(User, Server, Token),
+  ?DEBUG("jwt verify: Token=> ~p ", [Token]),
                     Rule = ejabberd_option:jwt_auth_only_rule(Server),
                     case acl:match_rule(Server, Rule,
                                         jid:make(User, Server, <<"">>)) of
                         deny ->
+?DEBUG("jwt verify: deny!!!", []),
+ ?DEBUG("jwt verify: deny useri=> ~p", [User]),
                             {nocache, Res};
                         allow ->
                             {nocache, {stop, Res}}
                     end
-            end
-    end.
+            end.
+   %% end.
 
 user_exists(_User, _Host) -> {nocache, false}.
 
@@ -86,23 +91,28 @@ use_cache(_) ->
 %%%----------------------------------------------------------------------
 check_jwt_token(User, Server, Token) ->
     JWK = ejabberd_option:jwt_key(Server),
+ ?DEBUG("jwt verify: key=> ~p ", [JWK]),
     JidField = ejabberd_option:jwt_jid_field(Server),
     try jose_jwt:verify(JWK, Token) of
         {true, {jose_jwt, Fields}, Signature} ->
             ?DEBUG("jwt verify: ~p - ~p~n", [Fields, Signature]),
 	    case maps:find(<<"exp">>, Fields) of
                 error ->
+ ?DEBUG("jwt verify: no exp! ", []),
 		    %% No expiry in token => We consider token invalid:
 		    false;
                 {ok, Exp} ->
                     Now = erlang:system_time(second),
                     if
                         Exp > Now ->
+?DEBUG("jwt verify: exp=> ~p ", [Exp]),
                             case maps:find(JidField, Fields) of
                                 error ->
+?DEBUG("jwt verify: dinf JID fail => ~p ", [JidField]),
                                     false;
                                 {ok, SJID} ->
                                     try
+?DEBUG("jwt verify: try find user ~p", [SJID]),
                                         JID = jid:decode(SJID),
                                         (JID#jid.luser == User) andalso
                                         (JID#jid.lserver == Server)
